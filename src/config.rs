@@ -113,39 +113,92 @@ pub struct HostEntry {
     pub hidden: bool,
     /// Overrides `[options] open_in` for this host.
     pub open_in: Option<OpenIn>,
+    /// Directories to offer on connect. More than one turns activating the
+    /// tile into a small picker.
+    #[serde(default)]
+    pub folders: Vec<String>,
 }
 
-/// A `[[host]]` block on its way to disk. A struct rather than seven
-/// positional strings, because half of them are interchangeable types.
+/// Which array-of-tables a draft belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Block {
+    #[default]
+    Host,
+    Local,
+}
+
+impl Block {
+    fn header(self) -> &'static str {
+        match self {
+            Block::Host => "[[host]]",
+            Block::Local => "[[local]]",
+        }
+    }
+
+    /// The key that identifies a block of this kind.
+    fn id_key(self) -> &'static str {
+        match self {
+            Block::Host => "name",
+            Block::Local => "label",
+        }
+    }
+}
+
+/// A block on its way to disk. A struct rather than a dozen positional
+/// strings, because most of them are interchangeable types.
 #[derive(Debug, Default, Clone)]
-pub struct HostDraft {
+pub struct Draft {
+    pub block: Block,
+    /// `name` for a host, `label` for a local.
     pub name: String,
     pub hostname: String,
     pub user: String,
     pub port: String,
     pub jump: String,
+    pub command: String,
+    pub detail: String,
+    pub folders: Vec<String>,
     pub color: String,
     pub hidden: bool,
     pub open_in: Option<OpenIn>,
 }
 
-impl HostDraft {
-    pub fn named(name: &str) -> Self {
-        Self { name: name.to_string(), ..Default::default() }
+impl Draft {
+    pub fn host(name: &str) -> Self {
+        Self { block: Block::Host, name: name.to_string(), ..Default::default() }
     }
 }
 
-impl From<&HostEntry> for HostDraft {
+impl From<&HostEntry> for Draft {
     fn from(h: &HostEntry) -> Self {
         Self {
+            block: Block::Host,
             name: h.name.clone(),
             hostname: h.hostname.clone().unwrap_or_default(),
             user: h.user.clone().unwrap_or_default(),
             port: h.port.map(|p| p.to_string()).unwrap_or_default(),
             jump: h.jump.clone().unwrap_or_default(),
+            folders: h.folders.clone(),
             color: h.color.clone().unwrap_or_default(),
             hidden: h.hidden,
             open_in: h.open_in,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&LocalEntry> for Draft {
+    fn from(l: &LocalEntry) -> Self {
+        Self {
+            block: Block::Local,
+            name: l.label.clone(),
+            command: l.command.clone(),
+            detail: l.detail.clone(),
+            folders: l.folders.clone(),
+            color: l.color.clone().unwrap_or_default(),
+            hidden: l.hidden,
+            open_in: l.open_in,
+            ..Default::default()
         }
     }
 }
@@ -161,6 +214,9 @@ pub struct LocalEntry {
     #[serde(default)]
     pub hidden: bool,
     pub open_in: Option<OpenIn>,
+    /// Directories to start the command in.
+    #[serde(default)]
+    pub folders: Vec<String>,
 }
 
 pub fn dir() -> PathBuf {
@@ -203,6 +259,36 @@ fn machine_name() -> String {
 
 fn login_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+/// The workspace manager, if this machine has one: `hsl` (herdr plus its status
+/// line) before plain `herdr`, the same order and for the same reason as the
+/// dotfiles' own `hsl-login.sh`.
+///
+/// The local tile is what you press to get to it once the home screen owns the
+/// terminal-open slot, so shipping it pointed at a bare shell would quietly
+/// cost you the thing that used to open with a terminal. `~/.local/bin` is
+/// searched even when PATH has not caught up with it yet, which is exactly the
+/// state a first run is in.
+fn workspace_manager() -> Option<(String, PathBuf)> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let dirs = path
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .chain(std::iter::once(home().join(".local/bin")));
+    let dirs: Vec<PathBuf> = dirs.collect();
+    for name in ["hsl", "herdr"] {
+        if let Some(p) = dirs.iter().map(|d| d.join(name)).find(|p| is_executable(p)) {
+            return Some((name.to_string(), p));
+        }
+    }
+    None
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 fn home() -> PathBuf {
@@ -257,15 +343,20 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          \n",
     );
 
-    // A tile for this machine, running your login shell. Deliberately the
-    // plain shell: a workspace manager is a fine thing to put here, but it is
-    // a choice, not a default.
+    // A tile for this machine. It runs the workspace manager where there is
+    // one, because that is what used to open with a terminal, and a plain login
+    // shell where there is not. `current` either way: a local command takes
+    // over this tab rather than opening another one.
+    let (detail, command) = match workspace_manager() {
+        Some((name, path)) => (format!("{name} · workspace manager"), path.display().to_string()),
+        None => ("local shell".to_string(), login_shell()),
+    };
     s.push_str(&format!(
         "# Local tiles run a command on this machine. `open_in` decides where:\n\
          # a new tab, a new window, or \"current\" to take over this one.\n\
-         [[local]]\nlabel = {:?}\ndetail = \"local shell\"\ncommand = {:?}\n\n",
+         [[local]]\nlabel = {:?}\ndetail = {detail:?}\ncommand = {command:?}\n\
+         open_in = \"current\"\n\n",
         machine_name(),
-        login_shell(),
     ));
 
     s.push_str(
@@ -303,48 +394,64 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
 ///
 /// The fallback is what lets a host from ~/.ssh/config be customised -- the
 /// first edit has no block to update yet.
-pub fn save_host(original: Option<&str>, d: &HostDraft) -> std::io::Result<bool> {
-    save_host_at(&path(), original, d)
+pub fn save_block(original: Option<&str>, d: &Draft) -> std::io::Result<bool> {
+    save_block_at(&path(), original, d)
 }
 
-fn save_host_at(path: &Path, original: Option<&str>, d: &HostDraft) -> std::io::Result<bool> {
+fn save_block_at(path: &Path, original: Option<&str>, d: &Draft) -> std::io::Result<bool> {
     if let Some(o) = original {
-        if update_host_at(path, o, d)? {
+        if update_block_at(path, o, d)? {
             return Ok(true);
         }
     }
-    append_host_at(path, d).map(|()| false)
+    append_block_at(path, d).map(|()| false)
 }
 
-fn append_host_at(path: &Path, d: &HostDraft) -> std::io::Result<()> {
+fn append_block_at(path: &Path, d: &Draft) -> std::io::Result<()> {
     let mut text = fs::read_to_string(path).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str("\n[[host]]\n");
-    text.push_str(&host_body(d));
+    text.push_str(&format!("\n{}\n", d.block.header()));
+    text.push_str(&block_body(d));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, text)
 }
 
-/// The body of a `[[host]]` block, as TOML lines without the header. Empty
-/// fields are omitted rather than written blank, so they keep inheriting.
-fn host_body(d: &HostDraft) -> String {
-    let mut s = format!("name = {:?}\n", d.name);
-    for (key, value) in [
-        ("hostname", &d.hostname),
-        ("user", &d.user),
-        ("jump", &d.jump),
-        ("color", &d.color),
-    ] {
+/// The body of a block, as TOML lines without the header. Empty fields are
+/// omitted rather than written blank, so they keep inheriting.
+fn block_body(d: &Draft) -> String {
+    let mut s = format!("{} = {:?}\n", d.block.id_key(), d.name);
+    let pairs: &[(&str, &String)] = match d.block {
+        Block::Host => &[
+            ("hostname", &d.hostname),
+            ("user", &d.user),
+            ("jump", &d.jump),
+            ("color", &d.color),
+        ],
+        Block::Local => &[("command", &d.command), ("detail", &d.detail), ("color", &d.color)],
+    };
+    for (key, value) in pairs {
         if !value.trim().is_empty() {
             s.push_str(&format!("{key} = {:?}\n", value.trim()));
         }
     }
-    if let Ok(p) = d.port.trim().parse::<u16>() {
-        s.push_str(&format!("port = {p}\n"));
+    if d.block == Block::Host {
+        if let Ok(p) = d.port.trim().parse::<u16>() {
+            s.push_str(&format!("port = {p}\n"));
+        }
+    }
+    let folders: Vec<String> = d
+        .folders
+        .iter()
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .map(|f| format!("{f:?}"))
+        .collect();
+    if !folders.is_empty() {
+        s.push_str(&format!("folders = [{}]\n", folders.join(", ")));
     }
     if d.hidden {
         s.push_str("hidden = true\n");
@@ -361,13 +468,13 @@ fn is_header(line: &str) -> bool {
     t.starts_with('[') && !t.starts_with('#')
 }
 
-/// Find the `[[host]]` block whose `name` matches: returns (header, end) line
+/// Find the block of this kind whose id key matches: returns (header, end) line
 /// indices, `end` exclusive.
-fn find_host_block(lines: &[&str], name: &str) -> Option<(usize, usize)> {
-    let target = format!("name = {name:?}");
+fn find_block(lines: &[&str], block: Block, name: &str) -> Option<(usize, usize)> {
+    let target = format!("{} = {name:?}", block.id_key());
     let mut i = 0;
     while i < lines.len() {
-        if lines[i].trim() == "[[host]]" {
+        if lines[i].trim() == block.header() {
             let mut end = i + 1;
             while end < lines.len() && !is_header(lines[end]) {
                 end += 1;
@@ -386,10 +493,10 @@ fn find_host_block(lines: &[&str], name: &str) -> Option<(usize, usize)> {
 /// Rewrite one `[[host]]` block in place, keeping its position in the file (and
 /// therefore its position on screen) and every other line untouched.
 #[allow(clippy::too_many_arguments)]
-fn update_host_at(path: &Path, original: &str, d: &HostDraft) -> std::io::Result<bool> {
+fn update_block_at(path: &Path, original: &str, d: &Draft) -> std::io::Result<bool> {
     let text = fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
-    let Some((start, end)) = find_host_block(&lines, original) else { return Ok(false) };
+    let Some((start, end)) = find_block(&lines, d.block, original) else { return Ok(false) };
 
     // Trailing blanks belong to the separation between blocks, not the block.
     let mut body_end = end;
@@ -398,7 +505,7 @@ fn update_host_at(path: &Path, original: &str, d: &HostDraft) -> std::io::Result
     }
 
     let mut out: Vec<String> = lines[..=start].iter().map(|s| s.to_string()).collect();
-    out.extend(host_body(d).lines().map(String::from));
+    out.extend(block_body(d).lines().map(String::from));
     out.extend(lines[body_end..].iter().map(|s| s.to_string()));
 
     let mut joined = out.join("\n");
@@ -409,14 +516,14 @@ fn update_host_at(path: &Path, original: &str, d: &HostDraft) -> std::io::Result
 
 /// Remove the `[[host]]` block whose `name` matches, leaving every other line
 /// alone. Returns whether anything was removed.
-pub fn remove_host(name: &str) -> std::io::Result<bool> {
-    remove_host_at(&path(), name)
+pub fn remove_block(block: Block, name: &str) -> std::io::Result<bool> {
+    remove_block_at(&path(), block, name)
 }
 
-fn remove_host_at(path: &Path, name: &str) -> std::io::Result<bool> {
+fn remove_block_at(path: &Path, block: Block, name: &str) -> std::io::Result<bool> {
     let text = fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
-    let Some((start, end)) = find_host_block(&lines, name) else { return Ok(false) };
+    let Some((start, end)) = find_block(&lines, block, name) else { return Ok(false) };
 
     let mut out: Vec<&str> = lines[..start].to_vec();
     // Also drop the blank line the block was separated by, so repeated
@@ -504,8 +611,8 @@ mod tests {
         toml::from_str(&fs::read_to_string(p).unwrap()).unwrap()
     }
 
-    fn draft(name: &str) -> HostDraft {
-        HostDraft::named(name)
+    fn draft(name: &str) -> Draft {
+        Draft::host(name)
     }
 
     const SEED: &str = "# a comment someone wrote\n\
@@ -520,7 +627,8 @@ mod tests {
     #[test]
     fn add_then_edit_then_delete_leaves_the_file_as_it_started() {
         let p = scratch("roundtrip", SEED);
-        let full = HostDraft {
+        let full = Draft {
+            block: Block::Host,
             name: "srv".into(),
             hostname: "10.0.0.5".into(),
             user: "albe".into(),
@@ -529,8 +637,9 @@ mod tests {
             color: "#4f8ab0".into(),
             hidden: false,
             open_in: None,
+            ..Default::default()
         };
-        assert!(!save_host_at(&p, None, &full).unwrap(), "appended, not updated");
+        assert!(!save_block_at(&p, None, &full).unwrap(), "appended, not updated");
 
         let cfg = parse(&p);
         let h = cfg.hosts.iter().find(|h| h.name == "srv").unwrap();
@@ -541,7 +650,7 @@ mod tests {
         // Renaming and clearing optional fields must both stick.
         let mut renamed = draft("srv2");
         renamed.hostname = "10.0.0.9".into();
-        assert!(save_host_at(&p, Some("srv"), &renamed).unwrap(), "updated in place");
+        assert!(save_block_at(&p, Some("srv"), &renamed).unwrap(), "updated in place");
         let cfg = parse(&p);
         let h = cfg.hosts.iter().find(|h| h.name == "srv2").unwrap();
         assert_eq!(h.hostname.as_deref(), Some("10.0.0.9"));
@@ -549,7 +658,7 @@ mod tests {
         assert_eq!(h.port, None);
         assert_eq!(h.color, None);
 
-        assert!(remove_host_at(&p, "srv2").unwrap());
+        assert!(remove_block_at(&p, Block::Host, "srv2").unwrap());
         assert_eq!(fs::read_to_string(&p).unwrap(), SEED, "back to byte-identical");
     }
 
@@ -560,7 +669,7 @@ mod tests {
         let p = scratch("hide", SEED);
         let mut d = draft("csnhr");
         d.hidden = true;
-        assert!(!save_host_at(&p, Some("csnhr"), &d).unwrap(), "no block existed, so appended");
+        assert!(!save_block_at(&p, Some("csnhr"), &d).unwrap(), "no block existed, so appended");
 
         let cfg = parse(&p);
         let h = cfg.hosts.iter().find(|h| h.name == "csnhr").unwrap();
@@ -571,7 +680,7 @@ mod tests {
 
         // And unhiding takes the block back out to nothing but the name.
         d.hidden = false;
-        assert!(save_host_at(&p, Some("csnhr"), &d).unwrap(), "now updates in place");
+        assert!(save_block_at(&p, Some("csnhr"), &d).unwrap(), "now updates in place");
         let text = fs::read_to_string(&p).unwrap();
         assert!(!text.contains("hidden"), "the flag is dropped, not written false");
     }
@@ -582,13 +691,13 @@ mod tests {
         let mut d = draft("srv");
         d.color = "#4f8ab0".into();
         d.user = "albe".into();
-        save_host_at(&p, None, &d).unwrap();
+        save_block_at(&p, None, &d).unwrap();
 
         // What the `x` key does: reload the block, flip one bit, write it back.
         let existing = parse(&p).hosts.into_iter().find(|h| h.name == "srv").unwrap();
-        let mut back = HostDraft::from(&existing);
+        let mut back = Draft::from(&existing);
         back.hidden = true;
-        save_host_at(&p, Some("srv"), &back).unwrap();
+        save_block_at(&p, Some("srv"), &back).unwrap();
 
         let h = parse(&p).hosts.into_iter().find(|h| h.name == "srv").unwrap();
         assert!(h.hidden);
@@ -599,11 +708,11 @@ mod tests {
     #[test]
     fn other_blocks_and_comments_survive_an_edit() {
         let p = scratch("preserve", SEED);
-        save_host_at(&p, None, &draft("a")).unwrap();
-        save_host_at(&p, None, &draft("b")).unwrap();
+        save_block_at(&p, None, &draft("a")).unwrap();
+        save_block_at(&p, None, &draft("b")).unwrap();
         let mut changed = draft("a");
         changed.hostname = "changed".into();
-        save_host_at(&p, Some("a"), &changed).unwrap();
+        save_block_at(&p, Some("a"), &changed).unwrap();
 
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains("# a comment someone wrote"));
@@ -619,11 +728,11 @@ mod tests {
     fn editing_keeps_a_host_in_place_rather_than_moving_it_to_the_end() {
         let p = scratch("order", SEED);
         for n in ["one", "two", "three"] {
-            save_host_at(&p, None, &draft(n)).unwrap();
+            save_block_at(&p, None, &draft(n)).unwrap();
         }
         let mut d = draft("one");
         d.hostname = "h".into();
-        save_host_at(&p, Some("one"), &d).unwrap();
+        save_block_at(&p, Some("one"), &d).unwrap();
         let names: Vec<String> = parse(&p).hosts.into_iter().map(|h| h.name).collect();
         assert_eq!(names, ["one", "two", "three"], "tile order must not shuffle");
     }
@@ -631,8 +740,8 @@ mod tests {
     #[test]
     fn missing_targets_are_reported_not_invented() {
         let p = scratch("missing", SEED);
-        assert!(!update_host_at(&p, "ghost", &draft("ghost")).unwrap());
-        assert!(!remove_host_at(&p, "ghost").unwrap());
+        assert!(!update_block_at(&p, "ghost", &draft("ghost")).unwrap());
+        assert!(!remove_block_at(&p, Block::Host, "ghost").unwrap());
         assert_eq!(fs::read_to_string(&p).unwrap(), SEED);
     }
 
@@ -675,8 +784,68 @@ mod tests {
         let p = scratch("openin", SEED);
         let mut d = draft("srv");
         d.open_in = Some(OpenIn::Current);
-        save_host_at(&p, None, &d).unwrap();
+        save_block_at(&p, None, &d).unwrap();
         assert_eq!(parse(&p).hosts[0].open_in, Some(OpenIn::Current));
+    }
+
+    /// Local tiles go through the same writer, into their own array.
+    #[test]
+    fn a_local_block_round_trips_with_its_folders() {
+        let p = scratch("local", SEED);
+        let d = Draft {
+            block: Block::Local,
+            name: "MACBOOK".into(),
+            command: "/bin/zsh".into(),
+            detail: "local shell".into(),
+            folders: vec!["~/code/one".into(), "~/code/two".into()],
+            ..Default::default()
+        };
+        assert!(!save_block_at(&p, None, &d).unwrap());
+
+        let cfg = parse(&p);
+        let l = cfg.locals.iter().find(|l| l.label == "MACBOOK").unwrap();
+        assert_eq!(l.command, "/bin/zsh");
+        assert_eq!(l.folders, ["~/code/one", "~/code/two"]);
+
+        // The seeded [[local]] must be untouched, and removal must find the
+        // right one of the two.
+        assert_eq!(cfg.locals.len(), 2);
+        assert!(remove_block_at(&p, Block::Local, "MACBOOK").unwrap());
+        assert_eq!(parse(&p).locals.len(), 1);
+    }
+
+    #[test]
+    fn folders_round_trip_on_a_host() {
+        let p = scratch("folders", SEED);
+        let mut d = draft("srv");
+        d.folders = vec!["/srv/app".into(), "/var/log".into()];
+        save_block_at(&p, None, &d).unwrap();
+        assert_eq!(parse(&p).hosts[0].folders, ["/srv/app", "/var/log"]);
+
+        // Clearing them drops the key rather than writing an empty array.
+        d.folders.clear();
+        save_block_at(&p, Some("srv"), &d).unwrap();
+        assert!(!fs::read_to_string(&p).unwrap().contains("folders"));
+    }
+
+    /// A host and a local may share a name without colliding, because the
+    /// writer keys on the block's own id field.
+    #[test]
+    fn blocks_of_different_kinds_do_not_collide() {
+        let p = scratch("kinds", SEED);
+        save_block_at(&p, None, &draft("twin")).unwrap();
+        let local = Draft {
+            block: Block::Local,
+            name: "twin".into(),
+            command: "/bin/sh".into(),
+            ..Default::default()
+        };
+        save_block_at(&p, None, &local).unwrap();
+        assert!(remove_block_at(&p, Block::Local, "twin").unwrap());
+
+        let cfg = parse(&p);
+        assert!(cfg.hosts.iter().any(|h| h.name == "twin"), "the host survives");
+        assert!(!cfg.locals.iter().any(|l| l.label == "twin"), "the local is gone");
     }
 
     #[test]
@@ -684,7 +853,7 @@ mod tests {
         let p = scratch("quoting", SEED);
         let mut d = draft("odd");
         d.hostname = "a\"b\\c".into();
-        save_host_at(&p, None, &d).unwrap();
+        save_block_at(&p, None, &d).unwrap();
         assert_eq!(parse(&p).hosts[0].hostname.as_deref(), Some("a\"b\\c"));
     }
 }

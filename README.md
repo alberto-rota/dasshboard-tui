@@ -89,15 +89,70 @@ rather it didn't, pin that host to another colour.
 | `x` | hide the selected host (or unhide it, with `show_hidden` on) |
 | `d` | delete a host, or revert an `~/.ssh/config` one (asks first) |
 | `t` / `w` / `c` | open in a new tab / new window / this surface, once |
-| `s` | settings — options, destination and both colours |
+| `s` | settings — whether it opens with a terminal, options, destination and both colours |
+| in the picker | `1`-`9` jump, `⏎` open, `esc` cancel |
 | `r` | re-read both config files |
 | `q` / `esc` | quit into the shell underneath |
+
+## Folders
+
+A tile can carry directories to start in. Give a host more than zero and
+activating it asks which:
+
+```
+┏ open alex in ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃                                                ┃
+┃ ▌ 1 home              no cd                    ┃
+┃   2 atlas             /scratch/atlas           ┃
+┃   3 thesis            /home/v120bb18/thesis    ┃
+┃                                                ┃
+┃   ↑↓ move   1-9 jump   ⏎ open   esc cancel     ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+`home` is always first, so a host with folders is never *forced* into one. A
+one-off destination survives the picker: `w` then `2` opens that folder in a new
+window.
+
+```toml
+[[host]]
+name = "alex"
+folders = ["/scratch/atlas", "/home/v120bb18/thesis"]
+
+[[local]]
+label = "MACBOOK-PRO"
+command = "/bin/zsh"
+folders = ["~/dasshboard-tui", "~/dotfiles"]
+```
+
+The two kinds get there differently, because one directory is on this machine
+and the other isn't:
+
+- **local** — a real `cd` before the command runs, so argv stays exactly what
+  you configured.
+- **ssh** — the directory is on the far side, so it becomes a remote command:
+  `ssh <alias> -t 'cd <dir> && exec ${SHELL:-/bin/sh} -l'`. The `-t` forces a
+  tty, without which the remote shell isn't interactive; the `exec $SHELL -l`
+  leaves you in a login shell in that folder rather than a bare `sh`. The alias
+  still leads, so `IdentityFile` and friends keep applying.
+
+Paths are quoted for the shell that will read them, local or remote — and `~`
+is handled on whichever side owns the home directory it means. A **local** one
+is resolved here, because the destination is either a real `chdir` (which does
+no expansion at all) or a quoted `cd` (which stops it), so `~/Desktop` would
+otherwise be looked up as a directory *named* `~`. A **remote** one can't be
+resolved here at all, so the tilde is left outside the quotes for the far side
+to expand — `cd ~/'my dir'` — while the rest of the path stays one quoted word.
+Only a leading `~` or `~/…`; `~user` needs a passwd lookup, and mid-path tildes
+are literal in a shell too.
 
 ## Editing, in the TUI
 
 Everything is editable without leaving the terminal UI — there is no `$EDITOR`
-handoff. `a` and `e` open the same form; only `name` is required, and the rest
-falls back to ssh's own resolution. On the `color` row, `←`/`→` cycle `auto` and
+handoff. `a` and `e` open the same form, whose first row picks what you are
+describing: an **ssh host** or a **local command**. The field set changes with
+it, since the two share almost nothing past the name. Only the name is required
+(plus `command` for a local); the rest falls back to ssh's own resolution. On the `color` row, `←`/`→` cycle `auto` and
 the eight presets, or type a hex; the row previews the swatch and the exact
 circle the tab will carry. `s` opens settings and writes each toggle through
 immediately, so the file and the screen can never disagree.
@@ -194,9 +249,9 @@ open_in = "window"          # overrides the global for this host
 Edits rewrite whole blocks **as text** rather than re-serialising the document,
 so your comments and formatting survive: `add_then_edit_then_delete_leaves_the_file_as_it_started`
 asserts the file comes back byte-identical, and editing a host keeps it in
-position rather than moving it to the end. `a`/`e`/`d` only ever touch
-`[[host]]` blocks in this file. Local tiles are the one thing still edited by
-hand; `e` on one says so rather than failing quietly.
+position rather than moving it to the end. `a`/`e`/`d` work on `[[host]]` and
+`[[local]]` blocks alike, keyed on `name` and `label` respectively — so a host
+and a local tile may share a name without colliding.
 
 A TOML syntax error is reported in the status line and leaves the previous
 screen usable; a typo must never cost you the home screen.
@@ -244,27 +299,86 @@ same file and every option termhome doesn't model — `IdentityFile`,
 `ForwardX11`, `IdentitiesOnly` — still applies. Overrides preserve that by
 riding in as `-o Key=Value` before the alias rather than replacing it.
 
-## Launching
+## Launching, opt in
 
-`~/.zshrc` has two marked blocks. See the comments there; the short version is
-that the dotfiles' `hsl-login.sh` already claimed the terminal-open slot and
-blocks until you quit herdr, so part 1 sets `NO_HSL=1` *before* that source and
-part 2 runs termhome *after* it (where PATH is complete). herdr is
-un-autostarted, not disabled: type `hsl`, or press its tile.
+**Installing the package does not touch your shell.** It puts a binary on PATH
+and nothing else; typing `dasshboard` is the whole of it. Opening with a
+terminal is a second, explicit act, because that slot is usually already taken —
+here by the dotfiles' `hsl-login.sh`, which starts herdr — and two full-screen
+TUIs can't both own a new surface.
 
-The guards mirror `hsl-login.sh`'s. The `HERDR_*` one is load-bearing: every
-herdr pane sources this rc, so without it each new pane would open a termhome
-inside itself.
+```sh
+dasshboard --startup        # is it hooked? which file?
+dasshboard --startup on     # hook it
+dasshboard --startup off    # unhook it, exactly
+dasshboard --startup print  # the hook as text, for a shell it can't write
+```
 
-**Escape hatches** — `DASSHBOARD_SKIP=1 zsh -l` for a bare shell, `homescreen` to
-bring the UI back up, or delete the two marked blocks (`~/.zshrc.bak.termhome`
-is the pre-install copy; removing them restores herdr autostart).
+The first row of `s` is the same switch, and says which file it will edit.
+
+`on` writes two marked blocks into `~/.zshrc` (or `~/.bashrc`), keeping one
+pre-install copy at `~/.zshrc.bak.dasshboard`. It is idempotent, so it doubles
+as the upgrade path for an older hook, and `off` removes exactly what it added —
+your rc comes back byte-identical, which is what hands the terminal-open slot
+back to whatever had it.
+
+The split into two blocks is forced by *when* each half must run.
+`hsl-login.sh` is sourced as the last act of the dotfiles' rc and **blocks**
+until you quit herdr, so anything after it never reaches the screen: part 1 goes
+above, part 2 (the UI, where PATH is finally complete) goes at the very bottom.
+
+Both halves ask the same shell function, and that is the load-bearing part:
+
+- **`NO_HSL=1` is conditional.** Part 1 sets `hsl-login.sh`'s own escape hatch
+  only in a shell dasshboard is actually going to draw in. Every shell it
+  declines — inside tmux, a herdr pane, an agent, not Ghostty — gets herdr
+  exactly as if dasshboard were not installed. An unconditional `export` here
+  suppressed the workspace manager machine-wide, which is the bug this shape
+  fixes.
+- **and unexported.** `hsl-login.sh` is *sourced* by the same shell, so a plain
+  variable reaches it. An exported one would be inherited by the shell a local
+  tile execs — the one place you most want herdr — and silently suppress it
+  there.
+- **the binary is found by path, not by PATH.** Part 1 runs *above* the rc that
+  puts `~/.local/bin` on PATH, so `command -v dasshboard` there answers "not
+  installed" — and a guard that believed it handed the slot straight back to
+  herdr, so a hooked shell came up in the workspace manager and part 2 never
+  ran. `--startup on` bakes in the directory it was enabled from, a short list
+  of the usual places follows, and PATH is consulted last, where part 2 has a
+  complete one anyway. Part 2 then launches exactly what the guard found.
+- **`DASSHBOARD_SKIP` is exported**, both by part 2 and by dasshboard itself
+  around a handoff, so a shell below a home screen never opens a second one
+  inside itself. That same flag is what makes the first point work: the local
+  tile lands in a normal login shell, and *that* is where herdr starts.
+
+The `HERDR_*` guard is load-bearing for the same family of reasons: every herdr
+pane sources this rc, so without it each new pane would open a dasshboard inside
+itself.
+
+**Escape hatches** — `DASSHBOARD_SKIP=1 zsh -l` for a shell with no home screen,
+`NO_HSL=1` alongside it for one with no workspace manager either, `homescreen` to
+bring the UI back up, and `dasshboard --startup off` to undo the whole thing.
+
+### The local tile
+
+Once the home screen owns the terminal-open slot, the local tile is how you
+reach the thing that used to open with a terminal — so a first run points it at
+`hsl`, or plain `herdr`, whichever is installed, and only falls back to
+`$SHELL` on a machine with neither. Either way it works: a tile running a bare
+shell reads the same rc, whose guard now declines, so the dotfiles start herdr
+in it.
 
 ## Install
 
 ```sh
 uv tool install dasshboard      # or: pipx install dasshboard
+dasshboard                      # try it
+dasshboard --startup on         # ...then, if you want it with every terminal
 ```
+
+Install is inert on purpose: the wheel has no install hook, no launch agent and
+no shell snippet. Nothing but `--startup on` (or the first row of `s`) will edit
+a file of yours — see [Launching, opt in](#launching-opt-in).
 
 The wheel is a Rust binary with a console-script entry point — there is no
 Python in it. maturin is the build backend and `uv build` drives it:
@@ -288,7 +402,17 @@ cargo test layout_dump -- --nocapture   # eyeball every screen at four sizes
 ./target/release/dasshboard --list      # tiles, colours and circles, no TUI
 ./target/release/dasshboard --open alex # spawn one tab, no TUI
 ./target/release/dasshboard --config    # print the config path
+./target/release/dasshboard --startup   # is it hooked into the shell rc?
 ```
+
+`src/startup.rs` owns the rc hook and its tests run against a scratch file, so
+they never touch your real `~/.zshrc`:
+`enable_then_disable_leaves_the_rc_byte_identical` is the uninstall promise,
+`enabling_twice_is_the_same_as_once` the reinstall one, and
+`no_hsl_is_conditional_and_unexported` pins the two properties that keep herdr
+working. `a_hooked_shell_starts_the_home_screen_when_path_is_incomplete` runs
+the generated blocks in a real `zsh` with the binary deliberately off PATH,
+which is the state part 1 actually runs in and the one a text assertion missed.
 
 The binary is symlinked rather than copied, so `cargo build --release` takes
 effect immediately. Don't `cargo clean` without rebuilding.

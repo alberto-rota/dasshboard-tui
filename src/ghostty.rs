@@ -64,7 +64,12 @@ fn scale_hex(hex: &str, factor: f32) -> Option<String> {
 /// 12 the cursor (full strength -- it is small enough to carry real colour).
 /// There is no tab-colour property in Ghostty's AppleScript dictionary, so
 /// changing what the surface reports about itself is the available lever.
-fn surface_command(title: &str, args: &[String], tint: Option<&str>) -> String {
+fn surface_command(
+    title: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    tint: Option<&str>,
+) -> String {
     let argv: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
 
     // The title goes through %s rather than into the format string, so a `%` in
@@ -87,6 +92,12 @@ fn surface_command(title: &str, args: &[String], tint: Option<&str>) -> String {
         ));
     }
 
+    // A local tile's directory is applied here rather than through Ghostty's
+    // own `initial working directory`, so the same path serves every
+    // destination -- including the exec that never reaches AppleScript.
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        inner.push_str(&format!("cd {} || exit 1; ", shell_quote(dir)));
+    }
     inner.push_str(&format!("exec {}", argv.join(" ")));
     format!("/bin/sh -c {}", shell_quote(&inner))
 }
@@ -103,6 +114,7 @@ pub fn open(
     where_to: OpenIn,
     label: &str,
     argv: &[String],
+    cwd: Option<&str>,
     tint: Option<&str>,
     emoji: Option<&str>,
 ) -> Result<String, String> {
@@ -130,7 +142,7 @@ pub fn open(
          environment variables:{{{guard}}}}}\n\
          {make}\n\
          end tell",
-        cmd = applescript_quote(&surface_command(&title, argv, tint)),
+        cmd = applescript_quote(&surface_command(&title, argv, cwd, tint)),
         guard = applescript_quote(&format!("{SKIP_VAR}=1")),
     ))
 }
@@ -173,15 +185,32 @@ mod tests {
     #[test]
     fn the_whole_argv_round_trips() {
         assert_eq!(
-            surface_command("alex", &argv(&["ssh", "alex"]), None),
+            surface_command("alex", &argv(&["ssh", "alex"]), None, None),
             r#"/bin/sh -c 'printf '\''\033]0;%s\007'\'' '\''alex'\''; exec '\''ssh'\'' '\''alex'\'''"#
         );
     }
 
     #[test]
     fn a_local_command_uses_the_same_path() {
-        let cmd = surface_command("MACBOOK-PRO", &argv(&["/bin/zsh", "-l"]), None);
+        let cmd = surface_command("MACBOOK-PRO", &argv(&["/bin/zsh", "-l"]), None, None);
         assert!(cmd.contains(r"exec '\''/bin/zsh'\'' '\''-l'\''"));
+    }
+
+    /// A spawned surface `cd`s before it execs, and the path arrives already
+    /// resolved -- the quoting here is absolute, so a `~` that got this far
+    /// would mean a directory literally named `~`, which is the failure this
+    /// pins against.
+    #[test]
+    fn a_folder_becomes_a_cd_before_the_exec() {
+        let cmd =
+            surface_command("MACBOOK-PRO", &argv(&["/bin/zsh"]), Some("/Users/albe/Desktop"), None);
+        assert!(cmd.find("cd ") < cmd.find("exec"), "cd has to come first: {cmd}");
+        assert!(cmd.contains(r"cd '\''/Users/albe/Desktop'\'' || exit 1"), "got {cmd}");
+        assert!(!cmd.contains('~'), "a tilde here would be taken literally: {cmd}");
+        assert!(
+            !surface_command("m", &argv(&["/bin/zsh"]), None, None).contains("cd "),
+            "no folder, no cd"
+        );
     }
 
     #[test]
@@ -189,7 +218,7 @@ mod tests {
         // Can't call open() in a test (it would spawn a tab), so check the same
         // composition the caller does.
         let title = format!("{} {}", "🔵", "alex");
-        let cmd = surface_command(&title, &argv(&["ssh", "alex"]), None);
+        let cmd = surface_command(&title, &argv(&["ssh", "alex"]), None, None);
         assert!(cmd.contains("🔵 alex"), "emoji reaches the title");
         assert!(cmd.contains(r"exec '\''ssh'\'' '\''alex'\''"), "ssh gets the bare alias");
         assert!(!cmd.contains("ssh '\\''🔵"), "emoji never reaches the command");
@@ -199,20 +228,20 @@ mod tests {
     fn quote_in_alias_stays_quoted() {
         // Not a realistic host name, but the escaping must not break out of the
         // single-quoted word if one ever appears.
-        let cmd = surface_command("we'ird", &argv(&["ssh", "we'ird"]), None);
+        let cmd = surface_command("we'ird", &argv(&["ssh", "we'ird"]), None, None);
         assert!(cmd.contains(r"'\''"));
         assert!(!cmd.contains("we'ird"));
     }
 
     #[test]
     fn each_arg_is_quoted_separately() {
-        let cmd = surface_command("srv", &argv(&["ssh", "-p", "2222", "albe@10.0.0.5"]), None);
+        let cmd = surface_command("srv", &argv(&["ssh", "-p", "2222", "albe@10.0.0.5"]), None, None);
         assert!(cmd.contains(r"'\''-p'\'' '\''2222'\'' '\''albe@10.0.0.5'\''"));
     }
 
     #[test]
     fn a_space_in_an_arg_does_not_split_it() {
-        let cmd = surface_command("odd", &argv(&["ssh", "a b"]), None);
+        let cmd = surface_command("odd", &argv(&["ssh", "a b"]), None, None);
         // One quoted word, not two: the space stays inside the quotes.
         assert!(cmd.contains(r"'\''a b'\''"));
     }
@@ -221,7 +250,7 @@ mod tests {
     fn background_is_scaled_down_but_the_cursor_is_not() {
         // 0x4f,0x8a,0xb0 * 0.13, rounded: 10, 18, 23.
         assert_eq!(scale_hex("#4f8ab0", 0.13), Some("#0a1217".to_string()));
-        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), Some("#4f8ab0"));
+        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), None, Some("#4f8ab0"));
         assert!(cmd.contains("]11;"), "sets background");
         assert!(cmd.contains("0a1217"), "background is the darkened value");
         assert!(cmd.contains("]12;"), "sets cursor");
@@ -232,14 +261,14 @@ mod tests {
 
     #[test]
     fn no_tint_means_no_osc_beyond_the_title() {
-        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), None);
+        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), None, None);
         assert!(!cmd.contains("]11;") && !cmd.contains("]12;"));
     }
 
     #[test]
     fn malformed_tint_is_dropped_not_emitted_raw() {
         assert_eq!(scale_hex("nope", 0.13), None);
-        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), Some("nope"));
+        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), None, Some("nope"));
         assert!(!cmd.contains("]11;"), "no background from unparseable hex");
     }
 

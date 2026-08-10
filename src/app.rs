@@ -10,13 +10,10 @@ use ratatui::layout::Rect;
 
 use crate::entry::{self, Entry};
 use crate::ghostty;
-use crate::config::{HostDraft, OpenIn};
+use crate::config::{Block, Draft, OpenIn};
 use crate::theme::Theme;
-use crate::ui::{
-    ACCENT_PRESETS, COLOR_ROW, ColorChoice, FIELDS, Form, HIDDEN_ROW, OPEN_ROW,
-    PRIMARY_PRESETS, SettingRow,
-};
-use crate::{config, ssh};
+use crate::ui::{ACCENT_PRESETS, ColorChoice, Form, KIND_ROW, PRIMARY_PRESETS, SettingRow};
+use crate::{config, ssh, startup};
 
 pub enum Mode {
     Browse,
@@ -27,6 +24,18 @@ pub enum Mode {
     ConfirmDelete(usize),
     /// Focused row in the settings list, plus the colour text being typed.
     Settings { focus: usize, buf: String },
+    /// Choosing where to land. `force` carries a one-off destination through
+    /// the picker so `w` then a folder still opens a window.
+    Folders { entry: usize, sel: usize, force: Option<OpenIn> },
+}
+
+/// `~/.zshrc` rather than `/Users/albe/.zshrc`: a settings row has 56 columns.
+fn short_home(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
+        _ => s,
+    }
 }
 
 pub struct Status {
@@ -51,12 +60,17 @@ pub struct App {
     /// Set when a Local tile is chosen: exec'd after the terminal is restored,
     /// so the command inherits this tab instead of opening a new one.
     pub handoff: Option<Vec<String>>,
+    /// Directory to chdir into before the handoff exec.
+    pub handoff_cwd: Option<String>,
     pub include_ssh_config: bool,
     pub tint_tabs: bool,
     pub tab_emoji: bool,
     pub show_hidden: bool,
     pub open_in: OpenIn,
     pub theme: Theme,
+    /// Whether the shell rc opens the home screen with a terminal. Lives in the
+    /// rc, not config.toml, so it is read on load rather than every frame.
+    pub startup: startup::State,
 }
 
 impl App {
@@ -74,12 +88,14 @@ impl App {
             cols: 1,
             quit: false,
             handoff: None,
+            handoff_cwd: None,
             include_ssh_config: true,
             tint_tabs: true,
             tab_emoji: true,
             show_hidden: false,
             open_in: OpenIn::Tab,
             theme: Theme::default(),
+            startup: startup::State::Off,
         };
         app.load(false);
         app
@@ -97,6 +113,7 @@ impl App {
             cfg.theme.accent.as_deref().unwrap_or(crate::theme::DEFAULT_ACCENT),
         );
         self.entries = entry::build(&cfg, &self.ssh_config);
+        self.startup = startup::state();
         self.clamp_selection();
         match (err, announce) {
             (Some(e), _) => self.say(e, false),
@@ -122,6 +139,16 @@ impl App {
 
     pub fn setting_rows(&self) -> Vec<SettingRow> {
         vec![
+            // First, because it is the only one that changes what happens
+            // outside this process -- and it starts off.
+            SettingRow::Startup {
+                label: "open with a new terminal",
+                on: self.startup.is_on(),
+                detail: match startup::rc_path() {
+                    Ok(rc) => short_home(&rc),
+                    Err(_) => "unsupported shell".into(),
+                },
+            },
             SettingRow::Toggle {
                 key: "include_ssh_config",
                 label: "show hosts from ~/.ssh/config",
@@ -203,26 +230,69 @@ impl App {
     /// own `open_in`, else the global default.
     pub fn activate_in(&mut self, vis: &[usize], force: Option<OpenIn>) {
         let Some(ei) = self.selected_entry(vis) else { return };
-        let e = &self.entries[ei];
-        if e.argv.is_empty() {
-            self.say(format!("{} has no command to run", e.label), false);
+        if self.entries[ei].argv.is_empty() {
+            self.say(format!("{} has no command to run", self.entries[ei].label), false);
             return;
         }
+        // With folders configured there is a choice to make, so ask rather than
+        // guessing which one you meant.
+        if !self.entries[ei].folders.is_empty() {
+            self.mode = Mode::Folders { entry: ei, sel: 0, force };
+            return;
+        }
+        self.launch(ei, None, force);
+    }
+
+    fn launch(&mut self, ei: usize, dir: Option<&str>, force: Option<OpenIn>) {
+        let e = &self.entries[ei];
         let where_to = force.or(e.open_in).unwrap_or(self.open_in);
-        let (label, argv) = (e.label.clone(), e.argv.clone());
+        let label = e.label.clone();
+        let argv = e.argv_in(dir);
+        let cwd = e.local_cwd(dir);
         let tint = self.tint_tabs.then(|| e.tint.hex.clone());
         let emoji = self.tab_emoji.then_some(e.tint.emoji);
+        let where_text =
+            dir.map_or_else(|| where_to.label().to_string(), |d| format!("{} · {d}", where_to.label()));
 
         if where_to == OpenIn::Current {
             // Handed to main() after the terminal is restored, so the command
             // inherits a clean screen and this tab.
             self.handoff = Some(argv);
+            self.handoff_cwd = cwd;
             self.quit = true;
             return;
         }
-        match ghostty::open(where_to, &label, &argv, tint.as_deref(), emoji) {
-            Ok(_) => self.say(format!("opened {} — {label}", where_to.label()), true),
+        match ghostty::open(where_to, &label, &argv, cwd.as_deref(), tint.as_deref(), emoji) {
+            Ok(_) => self.say(format!("opened {where_text} — {label}"), true),
             Err(e) => self.say(e, false),
+        }
+    }
+
+    fn key_folders(&mut self, key: KeyEvent) {
+        let Mode::Folders { entry, sel, force } = self.mode else { return };
+        let n = self.entries[entry].folders.len() + 1;
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Browse,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::Folders { entry, sel: (sel + n - 1) % n, force }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::Folders { entry, sel: (sel + 1) % n, force }
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = c as usize - '1' as usize;
+                if i < n {
+                    self.mode = Mode::Browse;
+                    let dir = (i > 0).then(|| self.entries[entry].folders[i - 1].clone());
+                    self.launch(entry, dir.as_deref(), force);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.mode = Mode::Browse;
+                let dir = (sel > 0).then(|| self.entries[entry].folders[sel - 1].clone());
+                self.launch(entry, dir.as_deref(), force);
+            }
+            _ => {}
         }
     }
 
@@ -237,6 +307,7 @@ impl App {
             Mode::Add(_) | Mode::Edit(_) => self.key_form(key),
             Mode::ConfirmDelete(_) => self.key_confirm(key),
             Mode::Settings { .. } => self.key_settings(key),
+            Mode::Folders { .. } => self.key_folders(key),
         }
     }
 
@@ -250,7 +321,7 @@ impl App {
                 self.filter.clear();
                 self.sel = 0;
             }
-            KeyCode::Char('a') => self.mode = Mode::Add(Form::new()),
+            KeyCode::Char('a') => self.mode = Mode::Add(Form::new(Block::Host)),
             KeyCode::Char('e') => self.begin_edit(vis),
             KeyCode::Char('d') => self.begin_delete(vis),
             KeyCode::Char('s') => self.mode = Mode::Settings { focus: 0, buf: String::new() },
@@ -302,62 +373,82 @@ impl App {
 
     // -------------------------------------------------------------- editing
 
-    /// Open a host in the form. Hosts from `~/.ssh/config` are editable too:
+    /// Open a tile in the form. Hosts from `~/.ssh/config` are editable too:
     /// saving writes a `[[host]]` override of the same name into config.toml
     /// and leaves the ssh config alone. Their name is the key that links the
     /// two, so it is the one field that can't be changed.
     fn begin_edit(&mut self, vis: &[usize]) {
         let Some(i) = self.selected_entry(vis) else { return };
         let tile = &self.entries[i];
-        if tile.is_local() {
-            self.say("local tiles are defined in config.toml by hand".into(), false);
-            return;
-        }
-
         let name = tile.label.clone();
-        let placeholders = [
-            String::new(),
-            tile.defaults.hostname.clone(),
-            tile.defaults.user.clone(),
-            tile.defaults.port.clone(),
-            tile.defaults.jump.clone(),
-        ];
-        let from_ssh_config = tile.origin() != Some(entry::Origin::Custom);
-
-        // Only what config.toml actually says goes in the fields; anything
-        // inherited stays blank so it keeps tracking ~/.ssh/config.
         let (cfg, _) = config::load();
-        let ov = cfg.hosts.iter().find(|h| h.name == name);
-        let values = [
-            name.clone(),
-            ov.and_then(|h| h.hostname.clone()).unwrap_or_default(),
-            ov.and_then(|h| h.user.clone()).unwrap_or_default(),
-            ov.and_then(|h| h.port.map(|p| p.to_string())).unwrap_or_default(),
-            ov.and_then(|h| h.jump.clone()).unwrap_or_default(),
-        ];
-        self.mode = Mode::Edit(Form::edit(
-            values,
-            ov.and_then(|h| h.color.as_deref()),
-            placeholders,
-            from_ssh_config,
-            ov.is_some_and(|h| h.hidden),
-            ov.and_then(|h| h.open_in),
-        ));
+
+        let mut form = if tile.is_local() {
+            let Some(l) = cfg.locals.iter().find(|l| l.label == name) else {
+                self.say(format!("{name} is not in config.toml"), false);
+                return;
+            };
+            let mut f = Form::new(Block::Local);
+            f.set("label", &l.label);
+            f.set("command", &l.command);
+            f.set("detail", &l.detail);
+            f.set("folders", l.folders.join(", "));
+            f.color = ColorChoice::from_config(l.color.as_deref());
+            f.hidden = l.hidden;
+            f.open_in = l.open_in;
+            f
+        } else {
+            let ov = cfg.hosts.iter().find(|h| h.name == name);
+            let mut f = Form::new(Block::Host);
+            f.set("name", &name);
+            // Only what config.toml actually says goes in the fields; anything
+            // inherited stays blank so it keeps tracking ~/.ssh/config.
+            f.set("hostname", ov.and_then(|h| h.hostname.clone()).unwrap_or_default());
+            f.set("user", ov.and_then(|h| h.user.clone()).unwrap_or_default());
+            f.set("port", ov.and_then(|h| h.port.map(|p| p.to_string())).unwrap_or_default());
+            f.set("jump", ov.and_then(|h| h.jump.clone()).unwrap_or_default());
+            f.set("folders", ov.map(|h| h.folders.join(", ")).unwrap_or_default());
+            f.set_placeholder("hostname", tile.defaults.hostname.clone());
+            f.set_placeholder("user", tile.defaults.user.clone());
+            f.set_placeholder("port", tile.defaults.port.clone());
+            f.set_placeholder("jump", tile.defaults.jump.clone());
+            f.color = ColorChoice::from_config(ov.and_then(|h| h.color.as_deref()));
+            f.hidden = ov.is_some_and(|h| h.hidden);
+            f.open_in = ov.and_then(|h| h.open_in);
+            f.name_locked = tile.origin() != Some(entry::Origin::Custom);
+            f
+        };
+        form.editing = Some(name);
+        form.kind_locked = true;
+        form.focus = form.first_field() + usize::from(form.name_locked);
+        self.mode = Mode::Edit(form);
     }
 
     fn key_form(&mut self, key: KeyEvent) {
         let (Mode::Add(form) | Mode::Edit(form)) = &mut self.mode else { return };
+        let (color_row, hidden_row, open_row) =
+            (form.color_row(), form.hidden_row(), form.open_row());
+        let first = form.first_field();
+
         match key.code {
             KeyCode::Esc => self.mode = Mode::Browse,
             KeyCode::Tab | KeyCode::Down => form.move_focus(true),
             KeyCode::BackTab | KeyCode::Up => form.move_focus(false),
             KeyCode::Enter => self.submit_form(),
 
-            // On the colour row the arrows pick a swatch; on a text row they
-            // would do nothing useful, so they move between fields instead.
-            KeyCode::Left if form.focus == COLOR_ROW => form.color = form.color.cycle(false),
-            KeyCode::Right if form.focus == COLOR_ROW => form.color = form.color.cycle(true),
-            KeyCode::Backspace if form.focus == COLOR_ROW => {
+            KeyCode::Left if form.focus == KIND_ROW => form.switch_block(Block::Host),
+            KeyCode::Right if form.focus == KIND_ROW => form.switch_block(Block::Local),
+            KeyCode::Char(' ') if form.focus == KIND_ROW => {
+                let other =
+                    if form.block == Block::Host { Block::Local } else { Block::Host };
+                form.switch_block(other);
+            }
+
+            // On the toggle rows the arrows change the value; on a text row
+            // they would do nothing useful, so they move between fields.
+            KeyCode::Left if form.focus == color_row => form.color = form.color.cycle(false),
+            KeyCode::Right if form.focus == color_row => form.color = form.color.cycle(true),
+            KeyCode::Backspace if form.focus == color_row => {
                 form.color = match &form.color {
                     ColorChoice::Custom(s) if s.len() > 1 => {
                         let mut s = s.clone();
@@ -367,14 +458,7 @@ impl App {
                     _ => ColorChoice::Auto,
                 }
             }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if form.focus == HIDDEN_ROW => {
-                form.hidden = !form.hidden
-            }
-            KeyCode::Left if form.focus == OPEN_ROW => form.cycle_open_in(false),
-            KeyCode::Right | KeyCode::Char(' ') if form.focus == OPEN_ROW => {
-                form.cycle_open_in(true)
-            }
-            KeyCode::Char(c) if form.focus == COLOR_ROW => {
+            KeyCode::Char(c) if form.focus == color_row => {
                 // Typing over a preset starts a fresh hex rather than appending
                 // to one the user never wrote.
                 form.color = match &form.color {
@@ -383,35 +467,47 @@ impl App {
                 }
             }
 
-            KeyCode::Backspace => {
-                form.values[form.focus].pop();
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if form.focus == hidden_row => {
+                form.hidden = !form.hidden
             }
-            KeyCode::Char(c) => form.values[form.focus].push(c),
+            KeyCode::Left if form.focus == open_row => form.cycle_open_in(false),
+            KeyCode::Right | KeyCode::Char(' ') if form.focus == open_row => {
+                form.cycle_open_in(true)
+            }
+
+            KeyCode::Backspace if form.focus >= first && form.focus < color_row => {
+                form.fields[form.focus - first].value.pop();
+            }
+            KeyCode::Char(c) if form.focus >= first && form.focus < color_row => {
+                form.fields[form.focus - first].value.push(c);
+            }
             _ => {}
         }
     }
 
     fn submit_form(&mut self) {
         let (Mode::Add(form) | Mode::Edit(form)) = &mut self.mode else { return };
-        let v: Vec<String> = form.values.iter().map(|s| s.trim().to_string()).collect();
-        let color = form.color.to_config();
+        let block = form.block;
+        let name = form.fields[0].value.trim().to_string();
         let editing = form.editing.clone();
-        let hidden = form.hidden;
-        let open_in = form.open_in;
+        let color = form.color.to_config();
 
         // Validate before touching the file -- a rejected form keeps what you
         // typed, so a typo costs one keystroke rather than the whole entry.
         let clashes = self
             .entries
             .iter()
-            .any(|e| e.label() == v[0] && Some(e.label()) != editing.as_deref());
-        let problem = if v[0].is_empty() {
-            Some("name is required".to_string())
-        } else if v[0].split_whitespace().count() > 1 {
+            .any(|e| e.label == name && Some(e.label.as_str()) != editing.as_deref());
+        let port = form.field("port").trim().to_string();
+        let problem = if name.is_empty() {
+            Some(format!("{} is required", if block == Block::Host { "name" } else { "label" }))
+        } else if name.split_whitespace().count() > 1 {
             Some("name cannot contain spaces".to_string())
         } else if clashes {
-            Some(format!("{} already exists", v[0]))
-        } else if !v[3].is_empty() && v[3].parse::<u16>().is_err() {
+            Some(format!("{name} already exists"))
+        } else if block == Block::Local && form.field("command").trim().is_empty() {
+            Some("command is required".to_string())
+        } else if !port.is_empty() && port.parse::<u16>().is_err() {
             Some("port must be a number".to_string())
         } else if !color.is_empty() && crate::entry::Tint::parse(&color).is_none() {
             Some("color must be #rrggbb".to_string())
@@ -423,17 +519,22 @@ impl App {
             return;
         }
 
-        let draft = HostDraft {
-            name: v[0].clone(),
-            hostname: v[1].clone(),
-            user: v[2].clone(),
-            port: v[3].clone(),
-            jump: v[4].clone(),
+        let draft = Draft {
+            block,
+            name: name.clone(),
+            hostname: form.field("hostname").trim().into(),
+            user: form.field("user").trim().into(),
+            port,
+            jump: form.field("jump").trim().into(),
+            command: form.field("command").trim().into(),
+            detail: form.field("detail").trim().into(),
+            folders: form.folder_list(),
             color,
-            hidden,
-            open_in,
+            hidden: form.hidden,
+            open_in: form.open_in,
         };
-        match config::save_host(editing.as_deref(), &draft) {
+
+        match config::save_block(editing.as_deref(), &draft) {
             Ok(updated) => {
                 let what = match (&editing, updated) {
                     (Some(_), true) => "updated",
@@ -441,7 +542,6 @@ impl App {
                     (Some(_), false) => "customised",
                     (None, _) => "added",
                 };
-                let name = v[0].clone();
                 self.mode = Mode::Browse;
                 self.load(false);
                 self.focus_named(&name);
@@ -451,26 +551,31 @@ impl App {
         }
     }
 
-    /// Hide or reveal the selected host, writing (or creating) its block. A
+    /// Hide or reveal the selected tile, writing (or creating) its block. A
     /// hidden host stays in ~/.ssh/config and still works as a ProxyJump -- it
     /// just stops taking up a tile.
     fn toggle_hidden(&mut self, vis: &[usize]) {
         let Some(i) = self.selected_entry(vis) else { return };
-        if self.entries[i].is_local() {
-            self.say("local tiles are defined in config.toml by hand".into(), false);
-            return;
-        }
-        let name = self.entries[i].label().to_string();
+        let name = self.entries[i].label.clone();
         let (cfg, _) = config::load();
-        let mut draft = cfg
-            .hosts
-            .iter()
-            .find(|h| h.name == name)
-            .map(HostDraft::from)
-            .unwrap_or_else(|| HostDraft::named(&name));
+        let mut draft = if self.entries[i].is_local() {
+            match cfg.locals.iter().find(|l| l.label == name) {
+                Some(l) => Draft::from(l),
+                None => {
+                    self.say(format!("{name} is not in config.toml"), false);
+                    return;
+                }
+            }
+        } else {
+            cfg.hosts
+                .iter()
+                .find(|h| h.name == name)
+                .map(Draft::from)
+                .unwrap_or_else(|| Draft::host(&name))
+        };
         draft.hidden = !draft.hidden;
 
-        match config::save_host(Some(&name), &draft) {
+        match config::save_block(Some(&name), &draft) {
             Ok(_) => {
                 self.load(false);
                 self.focus_named(&name);
@@ -487,12 +592,10 @@ impl App {
 
     fn begin_delete(&mut self, vis: &[usize]) {
         let Some(i) = self.selected_entry(vis) else { return };
-        if self.entries[i].has_own_block() {
+        if self.entries[i].has_own_block() || self.entries[i].is_local() {
             self.mode = Mode::ConfirmDelete(i);
-        } else if self.entries[i].is_local() {
-            self.say("local tiles are defined in config.toml by hand".into(), false);
         } else {
-            let name = self.entries[i].label();
+            let name = &self.entries[i].label;
             self.say(format!("{name} has no customisation to remove"), false);
         }
     }
@@ -505,8 +608,10 @@ impl App {
                 // Removing the block of an ~/.ssh/config host reverts it to
                 // whatever that file says; the tile itself stays.
                 let reverting = self.entries[i].origin() == Some(entry::Origin::SshOverridden);
+                let block =
+                    if self.entries[i].is_local() { Block::Local } else { Block::Host };
                 self.mode = Mode::Browse;
-                match config::remove_host(&name) {
+                match config::remove_block(block, &name) {
                     Ok(true) => {
                         self.load(false);
                         self.focus_named(&name);
@@ -554,6 +659,14 @@ impl App {
                     self.write_setting(|| config::set_option(k, !on), &format!("{k} = {}", !on));
                 }
             }
+            SettingRow::Startup { on, .. } => {
+                if matches!(
+                    key.code,
+                    KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Left | KeyCode::Right
+                ) {
+                    self.toggle_startup(on);
+                }
+            }
             SettingRow::Choice { key: k, .. } => {
                 let delta: i32 = match key.code {
                     KeyCode::Left => -1,
@@ -598,6 +711,30 @@ impl App {
                     *buf = buf_now;
                 }
             }
+        }
+    }
+
+    /// The shell rc, not config.toml -- so it says which file it touched, and
+    /// where the pre-install copy went the first time.
+    fn toggle_startup(&mut self, on: bool) {
+        let said = if on {
+            startup::disable().map(|(rc, removed)| {
+                if removed {
+                    format!("startup off — {} restored", short_home(&rc))
+                } else {
+                    "startup was already off".to_string()
+                }
+            })
+        } else {
+            startup::enable()
+                .map(|rc| format!("startup on — {} (backup {})", short_home(&rc), short_home(&startup::backup_path(&rc))))
+        };
+        match said {
+            Ok(msg) => {
+                self.startup = startup::state();
+                self.say(msg, true);
+            }
+            Err(e) => self.say(e, false),
         }
     }
 
@@ -667,6 +804,3 @@ impl App {
         }
     }
 }
-
-// Keeps `FIELDS` referenced from one place even though the form draws it.
-const _: () = assert!(FIELDS.len() == COLOR_ROW);

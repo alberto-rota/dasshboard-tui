@@ -10,6 +10,7 @@ mod config;
 mod entry;
 mod ghostty;
 mod ssh;
+mod startup;
 mod theme;
 mod ui;
 
@@ -44,7 +45,20 @@ fn main() -> io::Result<()> {
     // Only reached once the terminal is back to normal, so the handed-off
     // program starts on a clean screen and owns this tab from here on.
     if let Some(argv) = app.handoff {
-        let err = Command::new(&argv[0]).args(&argv[1..]).exec();
+        if let Some(dir) = &app.handoff_cwd {
+            if let Err(e) = std::env::set_current_dir(dir) {
+                eprintln!("dasshboard: could not enter {dir}: {e}");
+                std::process::exit(1);
+            }
+        }
+        // A local tile usually execs a shell, and that shell reads the same rc
+        // that started us. Without this it would draw a second home screen
+        // inside the first; with it, the rc's guard declines -- which is also
+        // what lets the dotfiles start herdr in that shell.
+        let err = Command::new(&argv[0])
+            .args(&argv[1..])
+            .env(ghostty::SKIP_VAR, "1")
+            .exec();
         eprintln!("dasshboard: could not exec {}: {err}", argv[0]);
         std::process::exit(1);
     }
@@ -100,7 +114,7 @@ fn run_cli() -> io::Result<Option<i32>> {
             } else {
                 where_to
             };
-            match ghostty::open(where_to, &name, &argv, hex.as_deref(), emoji) {
+            match ghostty::open(where_to, &name, &argv, None, hex.as_deref(), emoji) {
                 Ok(id) => {
                     println!("{id}");
                     Ok(Some(0))
@@ -115,16 +129,83 @@ fn run_cli() -> io::Result<Option<i32>> {
             println!("{}", config::path().display());
             Ok(Some(0))
         }
+        // Installing the package does not touch your shell; this is how the
+        // home screen gets to open with a terminal, and how it stops.
+        "--startup" => Ok(Some(startup_cli(args.next().as_deref()))),
         "--help" | "-h" => {
             println!(
-                "dasshboard [--list | --open <host> | --config | --help]\n\n\
-                 With no arguments, launches the TUI."
+                "dasshboard [--list | --open <host> | --config | --startup [on|off] | --help]\n\n\
+                 With no arguments, launches the TUI.\n\n\
+                 --startup            report whether the home screen opens with a terminal\n\
+                 --startup on         hook it into your shell rc (opt in; nothing else does this)\n\
+                 --startup off        unhook it, restoring whatever owned that slot before\n\
+                 --startup print      print the hook instead of writing it"
             );
             Ok(Some(0))
         }
         other => {
             eprintln!("unknown argument: {other}");
             Ok(Some(2))
+        }
+    }
+}
+
+/// `--startup [on|off|print]`. With no argument it only reports, since the
+/// whole point is that nothing changes your shell unless you say so.
+fn startup_cli(arg: Option<&str>) -> i32 {
+    let say_state = |rc: &std::path::Path| {
+        let st = startup::state_at(rc);
+        println!("startup: {} ({})", st.label(), rc.display());
+        if st == startup::State::Partial {
+            println!("run `dasshboard --startup on` to repair it, or `off` to remove it");
+        }
+    };
+
+    match arg {
+        None | Some("status") => match startup::rc_path() {
+            Ok(rc) => {
+                say_state(&rc);
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        Some("on" | "enable") => match startup::enable() {
+            Ok(rc) => {
+                println!("startup: on ({})", rc.display());
+                println!("a new Ghostty window opens the home screen; q drops you into the shell");
+                println!("pre-install copy: {}", startup::backup_path(&rc).display());
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        Some("off" | "disable") => match startup::disable() {
+            Ok((rc, true)) => {
+                println!("startup: off ({} restored)", rc.display());
+                println!("whatever owned the terminal-open slot before gets it back");
+                0
+            }
+            Ok((rc, false)) => {
+                println!("startup was already off ({})", rc.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        Some("print") => {
+            print!("{}", startup::script());
+            0
+        }
+        Some(other) => {
+            eprintln!("usage: dasshboard --startup [status|on|off|print], not {other}");
+            2
         }
     }
 }
@@ -199,10 +280,25 @@ mod tests {
             });
             println!("=== {label} ===\n{out}");
         }
-        let (_, add) = frame(120, 30, |a| a.mode = Mode::Add(Form::new()));
+        let (_, add) = frame(120, 30, |a| a.mode = Mode::Add(Form::new(config::Block::Host)));
         println!("=== add form ===\n{add}");
         let (_, del) = frame(120, 30, |a| a.mode = Mode::ConfirmDelete(0));
         println!("=== confirm ===\n{del}");
+        let (_, pick) = frame(120, 32, |a| {
+            if let Some(i) = a.entries.iter().position(|e| !e.hidden()) {
+                a.entries[i].folders =
+                    vec!["/scratch/atlas".into(), "/home/v120bb18/thesis".into()];
+                let vis = a.visible();
+                a.sel = vis.iter().position(|&x| x == i).unwrap();
+                a.on_key(
+                    ratatui::crossterm::event::KeyEvent::from(
+                        ratatui::crossterm::event::KeyCode::Enter,
+                    ),
+                    &vis,
+                );
+            }
+        });
+        println!("=== folder picker ===\n{pick}");
         let (_, edit) = frame(120, 30, |a| {
             let vis = a.visible();
             if let Some(s) = vis.iter().position(|&i| a.entries[i].origin().is_some()) {
@@ -272,6 +368,10 @@ mod tests {
         let mut app = App::new();
         let Some(i) = app.entries.iter().position(|e| !e.hidden()) else { return };
         app.entries[i].open_in = Some(OpenIn::Current);
+        // These tests run against whatever you have configured, and a tile with
+        // folders asks which one first -- a path with its own test. Destination
+        // resolution is what this is about, so take the question away.
+        app.entries[i].folders.clear();
         let vis = app.visible();
         app.sel = vis.iter().position(|&e| e == i).unwrap();
         let argv = app.entries[i].argv.clone();
@@ -293,10 +393,15 @@ mod tests {
         let vis = app.visible();
         let sel = vis.iter().position(|&e| e == i).unwrap();
 
+        // A tile with folders asks which one before it launches, which is a
+        // different question from where it launches.
+        let no_folders = |a: &mut App| a.entries[i].folders.clear();
+
         // Global says tab, tile says current: the tile wins, so this hands off.
         app.sel = sel;
         app.open_in = OpenIn::Tab;
         app.entries[i].open_in = Some(OpenIn::Current);
+        no_folders(&mut app);
         app.activate(&vis);
         assert!(app.handoff.is_some(), "tile setting beats the global");
 
@@ -305,6 +410,7 @@ mod tests {
         app.sel = sel;
         app.open_in = OpenIn::Current;
         app.entries[i].open_in = None;
+        no_folders(&mut app);
         app.activate(&vis);
         assert!(app.handoff.is_some(), "global applies when the tile is silent");
 
@@ -313,6 +419,7 @@ mod tests {
         app.sel = sel;
         app.open_in = OpenIn::Tab;
         app.entries[i].open_in = Some(OpenIn::Tab);
+        no_folders(&mut app);
         app.activate_in(&vis, Some(OpenIn::Current));
         assert!(app.handoff.is_some(), "the one-off key wins");
     }
@@ -348,11 +455,17 @@ mod tests {
         match &app.mode {
             Mode::Edit(f) => {
                 assert!(f.name_locked, "the alias joins the two files");
-                assert_eq!(f.values[0], name);
-                assert_ne!(f.focus, 0, "focus must skip the locked field");
+                assert_eq!(f.fields[0].value, name);
+                assert_ne!(f.focus, f.first_field(), "focus must skip the locked field");
                 // Blank fields track ~/.ssh/config, shown as placeholders.
-                assert!(f.values[1..].iter().all(String::is_empty), "no override yet");
-                assert!(f.placeholders.iter().any(|p| !p.is_empty()), "inherits something");
+                assert!(
+                    f.fields[1..].iter().all(|x| x.value.is_empty()),
+                    "no override yet"
+                );
+                assert!(
+                    f.fields.iter().any(|x| !x.placeholder.is_empty()),
+                    "inherits something"
+                );
             }
             _ => panic!("ssh config hosts must be editable"),
         }
@@ -414,18 +527,44 @@ mod tests {
         );
     }
 
+    /// Local tiles are editable now, with their own field set rather than the
+    /// host one.
     #[test]
-    fn local_tiles_are_not_editable_from_the_form() {
-        use ratatui::crossterm::event::KeyCode;
-        for key in [KeyCode::Char('e'), KeyCode::Char('d')] {
-            let mut app = App::new();
-            if !select(&mut app, |e| e.is_local()) {
-                return;
-            }
-            press(&mut app, key);
-            assert!(matches!(app.mode, Mode::Browse), "{key:?} must not open a dialog");
-            assert!(app.status.as_ref().is_some_and(|s| !s.good));
+    fn local_tiles_open_in_the_form_with_local_fields() {
+        use config::Block;
+        let mut app = App::new();
+        if !select(&mut app, |e| e.is_local()) {
+            return;
         }
+        press(&mut app, ratatui::crossterm::event::KeyCode::Char('e'));
+        match &app.mode {
+            Mode::Edit(f) => {
+                assert_eq!(f.block, Block::Local);
+                assert!(f.kind_locked, "editing must not change a tile's kind");
+                let keys: Vec<&str> = f.fields.iter().map(|x| x.key).collect();
+                assert_eq!(keys, ui::LOCAL_FIELDS, "local fields, not host ones");
+                assert!(!f.field("command").is_empty(), "prefilled from config");
+            }
+            _ => panic!("local tiles must be editable"),
+        }
+    }
+
+    /// Adding starts on the kind row so a local tile is one keystroke away.
+    #[test]
+    fn the_add_form_can_switch_to_a_local_tile() {
+        use config::Block;
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('a'));
+        let Mode::Add(f) = &app.mode else { panic!("a must open the form") };
+        assert_eq!(f.block, Block::Host);
+        assert_eq!(f.focus, ui::KIND_ROW);
+
+        press(&mut app, KeyCode::Right);
+        let Mode::Add(f) = &app.mode else { panic!() };
+        assert_eq!(f.block, Block::Local);
+        let keys: Vec<&str> = f.fields.iter().map(|x| x.key).collect();
+        assert_eq!(keys, ui::LOCAL_FIELDS);
     }
 
     /// The whole block, not just the grid, is centred in both axes.
@@ -468,14 +607,16 @@ mod tests {
 
     #[test]
     fn the_form_colour_row_cycles_and_previews() {
+        use config::Block;
         use ui::ColorChoice;
         let mut app = App::new();
-        app.mode = Mode::Add(Form::new());
-        for _ in 0..ui::FIELDS.len() {
+        let form = ui::Form::new(Block::Host);
+        let color_row = form.color_row();
+        app.mode = Mode::Add(form);
+        while !matches!(&app.mode, Mode::Add(f) if f.focus == color_row) {
             press(&mut app, ratatui::crossterm::event::KeyCode::Tab);
         }
         let Mode::Add(f) = &app.mode else { panic!("left the form") };
-        assert_eq!(f.focus, ui::COLOR_ROW);
         assert!(matches!(f.color, ColorChoice::Auto));
 
         press(&mut app, ratatui::crossterm::event::KeyCode::Right);
@@ -489,12 +630,35 @@ mod tests {
         assert!(matches!(f.color, ColorChoice::Preset(i) if i == entry::PALETTE.len() - 1));
     }
 
+    /// The one row that edits something outside config.toml leads the panel,
+    /// and it must not be reachable through the option writer -- `startup` is
+    /// not a key in `[options]`, and writing one there would do nothing at all.
+    #[test]
+    fn the_startup_row_leads_the_settings_and_is_not_an_option_key() {
+        use ui::SettingRow;
+        let app = App::new();
+        let rows = app.setting_rows();
+        assert!(matches!(rows[0], SettingRow::Startup { .. }), "startup comes first");
+        assert!(
+            rows[1..].iter().all(|r| !matches!(r, SettingRow::Startup { .. })),
+            "one switch, not two"
+        );
+        let keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SettingRow::Toggle { key, .. } | SettingRow::Choice { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(!keys.contains(&"startup"), "it lives in the shell rc, not the config");
+    }
+
     #[test]
     fn a_bad_hex_is_rejected_without_writing() {
         use ui::ColorChoice;
         let mut app = App::new();
-        let mut form = Form::new();
-        form.values[0] = "probe-host".into();
+        let mut form = Form::new(config::Block::Host);
+        form.set("name", "probe-host");
         form.color = ColorChoice::Custom("#zzz".into());
         app.mode = Mode::Add(form);
         press(&mut app, ratatui::crossterm::event::KeyCode::Enter);

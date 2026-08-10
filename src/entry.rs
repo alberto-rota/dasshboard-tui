@@ -179,6 +179,9 @@ pub struct Entry {
     pub hidden: bool,
     /// `None` defers to `[options] open_in`.
     pub open_in: Option<OpenIn>,
+    /// Directories this tile can start in. More than zero turns activating it
+    /// into a picker.
+    pub folders: Vec<String>,
     pub defaults: Defaults,
 }
 
@@ -216,12 +219,85 @@ impl Entry {
         matches!(self.origin, Some(Origin::Custom | Origin::SshOverridden))
     }
 
+    /// The argv for one launch, with the chosen directory applied.
+    ///
+    /// Local commands just start there. For ssh the directory is on the far
+    /// side, so it becomes a remote command: `-t` forces a tty (without it the
+    /// remote shell is not interactive), and `exec $SHELL -l` replaces it so
+    /// you get a login shell in that folder rather than a bare `sh`.
+    pub fn argv_in(&self, dir: Option<&str>) -> Vec<String> {
+        let (Some(dir), Kind::Ssh) = (dir.filter(|d| !d.is_empty()), self.kind) else {
+            return self.argv.clone();
+        };
+        let mut argv = self.argv.clone();
+        argv.push("-t".into());
+        argv.push(format!("cd {} && exec ${{SHELL:-/bin/sh}} -l", sh_quote_path(dir)));
+        argv
+    }
+
+    /// A local tile's directory is applied by the launcher, not baked into
+    /// argv, so it is reported separately -- with `~` resolved, since the
+    /// launcher is a `chdir` or a quoted `cd` and neither expands it.
+    pub fn local_cwd(&self, dir: Option<&str>) -> Option<String> {
+        matches!(self.kind, Kind::Local)
+            .then_some(dir)
+            .flatten()
+            .filter(|d| !d.is_empty())
+            .map(expand_home)
+    }
+
     pub fn matches(&self, needle: &str) -> bool {
         let n = needle.to_lowercase();
         self.label.to_lowercase().contains(&n)
             || self.detail.to_lowercase().contains(&n)
             || self.jump().is_some_and(|j| j.to_lowercase().contains(&n))
     }
+}
+
+/// Wrap in single quotes for a POSIX shell -- here, the *remote* one.
+/// Resolve a leading `~` against `$HOME`, for a path this machine will read.
+///
+/// Nothing downstream does it for us: a local folder becomes either a real
+/// `chdir` or a `cd` inside single quotes, and neither expands a tilde -- which
+/// is why `folders = ["~/Desktop"]` reported that the folder did not exist. Only
+/// a *leading* tilde, and only `~` or `~/...`: mid-path tildes are literal in a
+/// shell too, and `~user` needs a passwd lookup we would only get half right.
+pub fn expand_home(dir: &str) -> String {
+    let Some(rest) = dir.strip_prefix('~') else { return dir.to_string() };
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return dir.to_string();
+    }
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => format!("{}{rest}", home.trim_end_matches('/')),
+        _ => dir.to_string(),
+    }
+}
+
+/// Quote a path for a shell, leaving a leading `~` for that shell to expand.
+///
+/// A remote directory is the one case we cannot resolve ourselves -- the home
+/// it is relative to is on the far side -- so the tilde has to survive as
+/// syntax: `cd ~/'my dir'`. Everything after it is still quoted, so spaces and
+/// quotes in the path stay harmless.
+fn sh_quote_path(s: &str) -> String {
+    match s.strip_prefix('~') {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => match rest.trim_start_matches('/') {
+            "" => "~/".to_string(),
+            tail => format!("~/{}", sh_quote(tail)),
+        },
+        _ => sh_quote(s),
+    }
+}
+
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' { out.push_str("'\\''") } else { out.push(c) }
+    }
+    out.push('\'');
+    out
 }
 
 /// An `~/.ssh/config` host, with an optional config.toml block layered on top.
@@ -281,6 +357,7 @@ fn from_ssh_config(h: ssh::Host, ov: Option<&HostEntry>) -> Entry {
         origin: Some(if ov.is_some() { Origin::SshOverridden } else { Origin::Ssh }),
         hidden: ov.is_some_and(|o| o.hidden),
         open_in: ov.and_then(|o| o.open_in),
+        folders: ov.map(|o| o.folders.clone()).unwrap_or_default(),
         kind: Kind::Ssh,
         label: h.alias,
         detail,
@@ -322,6 +399,7 @@ fn from_config(e: &HostEntry) -> Entry {
         origin: Some(Origin::Custom),
         hidden: e.hidden,
         open_in: e.open_in,
+        folders: e.folders.clone(),
         defaults: Defaults::default(),
     }
 }
@@ -343,6 +421,7 @@ pub fn build(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
             origin: None,
             hidden: l.hidden,
             open_in: l.open_in,
+            folders: l.folders.clone(),
             defaults: Defaults::default(),
         })
         .collect();
@@ -400,6 +479,7 @@ mod tests {
             color: None,
             hidden: false,
             open_in: None,
+            folders: Vec::new(),
         })
     }
 
@@ -514,6 +594,7 @@ mod tests {
             color: color.map(Into::into),
             hidden: false,
             open_in: None,
+            folders: Vec::new(),
         }
     }
 
@@ -567,6 +648,85 @@ mod tests {
         assert_eq!(entries[0].tint().hex, "#9a68b0");
         assert_eq!(entries[0].origin(), Some(Origin::SshOverridden));
         assert_eq!(entries[1].origin(), Some(Origin::Custom));
+    }
+
+    /// The remote directory can't be a local `cd`, so it becomes a remote
+    /// command. `-t` is what makes it an interactive shell rather than a
+    /// one-shot; `exec $SHELL -l` is what leaves you in a login shell there.
+    #[test]
+    fn an_ssh_folder_becomes_a_remote_command() {
+        let t = from_ssh_config(ssh_host("alex"), None);
+        let argv = t.argv_in(Some("/scratch/project"));
+        assert_eq!(argv[..2], ["ssh", "alex"], "the alias still leads");
+        assert_eq!(argv[2], "-t", "a tty is required for an interactive shell");
+        assert_eq!(argv[3], "cd '/scratch/project' && exec ${SHELL:-/bin/sh} -l");
+        assert!(t.local_cwd(Some("/scratch/project")).is_none(), "not a local cd");
+    }
+
+    #[test]
+    fn no_folder_leaves_the_command_untouched() {
+        let t = from_ssh_config(ssh_host("alex"), None);
+        assert_eq!(t.argv_in(None), t.argv);
+        assert_eq!(t.argv_in(Some("")), t.argv, "an empty choice is no choice");
+    }
+
+    /// A quote in a path must not break out of the remote command.
+    #[test]
+    fn a_quote_in_a_remote_path_stays_quoted() {
+        let t = from_ssh_config(ssh_host("alex"), None);
+        let argv = t.argv_in(Some("/od'd"));
+        assert!(argv[3].contains(r"'/od'\''d'"), "got {}", argv[3]);
+    }
+
+    /// A local tile's folder is a real chdir, not part of argv, so the command
+    /// stays exactly what was configured.
+    #[test]
+    fn a_local_folder_is_a_cwd_not_an_argument() {
+        let mut cfg = Config::default();
+        cfg.options.include_ssh_config = false;
+        cfg.locals.push(crate::config::LocalEntry {
+            label: "MACBOOK".into(),
+            detail: "local shell".into(),
+            command: "/bin/zsh".into(),
+            color: None,
+            hidden: false,
+            open_in: None,
+            folders: vec!["~/code/app".into()],
+        });
+        let entries = build(&cfg, Path::new("/nonexistent"));
+        let t = &entries[0];
+        assert_eq!(t.folders, ["~/code/app"], "the config keeps the ~, for display");
+        assert_eq!(t.argv_in(Some("~/code/app")), ["/bin/zsh"], "argv unchanged");
+        // ...but what gets chdir'd into is a real path: nothing downstream of
+        // here expands a tilde.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(t.local_cwd(Some("~/code/app")).as_deref(), Some(&*format!("{home}/code/app")));
+        assert_eq!(t.local_cwd(Some("~")).as_deref(), Some(&*home), "bare ~ is home");
+        assert_eq!(
+            t.local_cwd(Some("/tmp/x")).as_deref(),
+            Some("/tmp/x"),
+            "an absolute path is left alone"
+        );
+        assert_eq!(
+            t.local_cwd(Some("~notauser/x")).as_deref(),
+            Some("~notauser/x"),
+            "~user is not ours to guess at"
+        );
+    }
+
+    /// A remote home is on the far side, so the tilde has to reach the remote
+    /// shell as syntax -- while the rest of the path stays quoted.
+    #[test]
+    fn a_remote_tilde_survives_the_quoting() {
+        let t = from_ssh_config(ssh_host("alex"), None);
+        let cmd = |d| t.argv_in(Some(d))[3].clone();
+        assert_eq!(cmd("~/thesis"), "cd ~/'thesis' && exec ${SHELL:-/bin/sh} -l");
+        assert_eq!(cmd("~"), "cd ~ && exec ${SHELL:-/bin/sh} -l");
+        assert_eq!(cmd("~/my dir"), "cd ~/'my dir' && exec ${SHELL:-/bin/sh} -l");
+        // The tilde must not become a licence to inject: everything after it is
+        // still one quoted word.
+        assert_eq!(cmd("~/od'd && rm -rf x"), r"cd ~/'od'\''d && rm -rf x' && exec ${SHELL:-/bin/sh} -l");
+        assert_eq!(cmd("~notauser/x"), "cd '~notauser/x' && exec ${SHELL:-/bin/sh} -l");
     }
 }
 

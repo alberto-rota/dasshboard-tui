@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::app::{App, Mode};
-use crate::config::OpenIn;
+use crate::config::{Block as CfgBlock, OpenIn};
 use crate::entry::{Entry, Origin, PALETTE, Tint};
 use crate::theme::Theme;
 
@@ -83,6 +83,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             dim_behind(f, full, th);
             let reverting = app.entries[*i].origin() == Some(Origin::SshOverridden);
             draw_confirm(f, full, app.entries[*i].label(), reverting, th);
+        }
+        Mode::Folders { entry, sel, .. } => {
+            dim_behind(f, full, th);
+            let e = &app.entries[*entry];
+            draw_folders(f, full, &e.label, &e.folders, *sel, th);
         }
         Mode::Settings { focus, buf } => {
             dim_behind(f, full, th);
@@ -386,11 +391,16 @@ fn modal_block(title: &str, th: &Theme) -> Block<'static> {
 
 // ------------------------------------------------------------------- form
 
-pub const FIELDS: [&str; 5] = ["name", "hostname", "user", "port", "jump"];
-/// The two toggle rows, which sit after the text fields.
-pub const COLOR_ROW: usize = FIELDS.len();
-pub const HIDDEN_ROW: usize = COLOR_ROW + 1;
-pub const OPEN_ROW: usize = HIDDEN_ROW + 1;
+pub const HOST_FIELDS: [&str; 6] =
+    ["name", "hostname", "user", "port", "jump", "folders"];
+pub const LOCAL_FIELDS: [&str; 4] = ["label", "command", "detail", "folders"];
+
+pub struct Field {
+    pub key: &'static str,
+    pub value: String,
+    /// What this field inherits if left blank.
+    pub placeholder: String,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum ColorChoice {
@@ -432,7 +442,6 @@ impl ColorChoice {
         if next == 0 { ColorChoice::Auto } else { ColorChoice::Preset((next - 1) as usize) }
     }
 
-    /// The tint to preview, given the name typed so far.
     fn preview(&self, name: &str) -> Option<Tint> {
         match self {
             ColorChoice::Auto => (!name.is_empty()).then(|| Tint::for_name(name)),
@@ -442,62 +451,110 @@ impl ColorChoice {
     }
 }
 
+/// The add/edit form. The field list depends on what is being described -- a
+/// host and a local tile have almost nothing in common past the name -- so it
+/// is a `Vec` rather than a fixed array, and the toggle rows sit after it.
 pub struct Form {
-    pub values: [String; 5],
-    /// What each blank field will inherit from ~/.ssh/config.
-    pub placeholders: [String; 5],
+    pub block: CfgBlock,
+    pub fields: Vec<Field>,
     pub color: ColorChoice,
+    pub hidden: bool,
+    pub open_in: Option<OpenIn>,
     pub focus: usize,
     pub error: Option<String>,
     /// The original name when editing; `None` when adding.
     pub editing: Option<String>,
-    /// For an ~/.ssh/config host the name is the key joining the two files, so
-    /// it is displayed but not editable.
+    /// An ~/.ssh/config host's name is the key joining the two files.
     pub name_locked: bool,
-    pub hidden: bool,
-    /// `None` means "use the global default".
-    pub open_in: Option<OpenIn>,
+    /// You can't turn a host into a local tile by editing it.
+    pub kind_locked: bool,
 }
 
+/// Row 0 picks host or local; the fields follow; the toggles come last.
+pub const KIND_ROW: usize = 0;
+
 impl Form {
-    pub fn new() -> Self {
+    fn fields_for(block: CfgBlock) -> Vec<Field> {
+        let keys: &[&'static str] = match block {
+            CfgBlock::Host => &HOST_FIELDS,
+            CfgBlock::Local => &LOCAL_FIELDS,
+        };
+        keys.iter()
+            .map(|k| Field { key: k, value: String::new(), placeholder: String::new() })
+            .collect()
+    }
+
+    pub fn new(block: CfgBlock) -> Self {
         Self {
-            values: Default::default(),
-            placeholders: Default::default(),
+            block,
+            fields: Form::fields_for(block),
             color: ColorChoice::Auto,
-            focus: 0,
+            hidden: false,
+            open_in: None,
+            focus: KIND_ROW,
             error: None,
             editing: None,
             name_locked: false,
-            hidden: false,
-            open_in: None,
+            kind_locked: false,
         }
     }
 
-    pub fn edit(
-        values: [String; 5],
-        color: Option<&str>,
-        placeholders: [String; 5],
-        name_locked: bool,
-        hidden: bool,
-        open_in: Option<OpenIn>,
-    ) -> Self {
-        Self {
-            editing: Some(values[0].clone()),
-            values,
-            placeholders,
-            color: ColorChoice::from_config(color),
-            focus: usize::from(name_locked),
-            error: None,
-            name_locked,
-            hidden,
-            open_in,
+    pub fn first_field(&self) -> usize {
+        KIND_ROW + 1
+    }
+    pub fn color_row(&self) -> usize {
+        self.first_field() + self.fields.len()
+    }
+    pub fn hidden_row(&self) -> usize {
+        self.color_row() + 1
+    }
+    pub fn open_row(&self) -> usize {
+        self.hidden_row() + 1
+    }
+    pub fn rows(&self) -> usize {
+        self.open_row() + 1
+    }
+
+    pub fn field(&self, key: &str) -> &str {
+        self.fields.iter().find(|f| f.key == key).map_or("", |f| f.value.as_str())
+    }
+
+    pub fn set(&mut self, key: &str, value: impl Into<String>) {
+        if let Some(f) = self.fields.iter_mut().find(|f| f.key == key) {
+            f.value = value.into();
         }
     }
 
-    /// Text fields plus the colour, hidden and destination rows.
-    pub fn rows() -> usize {
-        FIELDS.len() + 3
+    pub fn set_placeholder(&mut self, key: &str, value: impl Into<String>) {
+        if let Some(f) = self.fields.iter_mut().find(|f| f.key == key) {
+            f.placeholder = value.into();
+        }
+    }
+
+    /// Swap the field set, carrying across the two things both kinds have.
+    pub fn switch_block(&mut self, block: CfgBlock) {
+        if self.kind_locked || self.block == block {
+            return;
+        }
+        let (name, folders) = (self.fields[0].value.clone(), self.field("folders").to_string());
+        self.block = block;
+        self.fields = Form::fields_for(block);
+        self.fields[0].value = name;
+        self.set("folders", folders);
+        self.focus = KIND_ROW;
+    }
+
+    /// Move focus, stepping over the name when it is locked.
+    pub fn move_focus(&mut self, forward: bool) {
+        let n = self.rows();
+        let step = |i: usize| if forward { (i + 1) % n } else { (i + n - 1) % n };
+        self.focus = step(self.focus);
+        if self.name_locked && self.focus == self.first_field() {
+            self.focus = step(self.focus);
+        }
+        if self.kind_locked && self.focus == KIND_ROW {
+            self.focus = step(self.focus);
+        }
     }
 
     /// Cycle "use the default" and each explicit destination.
@@ -508,60 +565,91 @@ impl Form {
         self.open_in = (next > 0).then(|| OpenIn::ALL[(next - 1) as usize]);
     }
 
-    /// Move focus, stepping over the name when it is locked.
-    pub fn move_focus(&mut self, forward: bool) {
-        let n = Form::rows();
-        let step = |i: usize| if forward { (i + 1) % n } else { (i + n - 1) % n };
-        self.focus = step(self.focus);
-        if self.name_locked && self.focus == 0 {
-            self.focus = step(self.focus);
-        }
+    /// Folders are typed as one comma-separated line; splitting here keeps the
+    /// form a flat list of text rows instead of a nested editor.
+    pub fn folder_list(&self) -> Vec<String> {
+        self.field("folders")
+            .split(',')
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect()
     }
 }
 
 fn draw_form(f: &mut Frame, area: Rect, form: &Form, th: &Theme) {
     let title = match &form.editing {
         Some(n) => format!("edit {n}"),
-        None => "add host".to_string(),
+        None => "add".to_string(),
     };
-    let area = modal_area(f, area, 58, Form::rows() as u16 + 5);
+    let area = modal_area(f, area, 62, form.rows() as u16 + 5);
     let block = modal_block(&title, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let row_mark = |on: bool| {
+        Span::styled(if on { " ▌ " } else { "   " }, Style::default().fg(th.accent))
+    };
+    let label = |text: &str, on: bool| {
+        Span::styled(
+            format!("{text:<9}"),
+            Style::default().fg(if on { th.bright } else { th.muted }),
+        )
+    };
+
     let mut lines = vec![Line::raw("")];
-    for (i, name) in FIELDS.iter().enumerate() {
+
+    // Kind.
+    let on = form.focus == KIND_ROW && !form.kind_locked;
+    lines.push(Line::from(vec![
+        row_mark(on),
+        label("kind", on),
+        Span::styled(
+            match form.block {
+                CfgBlock::Host => "ssh host",
+                CfgBlock::Local => "local command",
+            },
+            Style::default().fg(if form.kind_locked { th.muted } else { th.primary }),
+        ),
+        Span::styled(
+            if form.kind_locked {
+                "   fixed".to_string()
+            } else if on {
+                "   ←/→ switch".to_string()
+            } else {
+                String::new()
+            },
+            Style::default().fg(th.faint),
+        ),
+    ]));
+
+    for (i, field) in form.fields.iter().enumerate() {
+        let row = form.first_field() + i;
         let locked = i == 0 && form.name_locked;
-        let focused = i == form.focus && !locked;
-        let value = &form.values[i];
-        // A blank field inherits: from ~/.ssh/config when there is something to
-        // inherit, otherwise from ssh's own resolution at connect time.
-        let inherited = &form.placeholders[i];
-        let hint = if !inherited.is_empty() {
-            format!("{inherited}  ~/.ssh/config")
+        let on = row == form.focus && !locked;
+        let hint = if !field.placeholder.is_empty() {
+            format!("{}  ~/.ssh/config", field.placeholder)
         } else {
-            match *name {
-                "name" => "required".into(),
+            match field.key {
+                "name" | "label" => "required".into(),
+                "command" => "required, e.g. /bin/zsh".into(),
                 "hostname" => "defaults to name".into(),
                 "port" => "22".into(),
+                "folders" => "comma separated; more than one asks".into(),
                 _ => "optional".into(),
             }
         };
         lines.push(Line::from(vec![
-            Span::styled(if focused { " ▌ " } else { "   " }, Style::default().fg(th.accent)),
+            row_mark(on),
+            label(field.key, on),
             Span::styled(
-                format!("{name:<9}"),
-                Style::default().fg(if focused { th.bright } else { th.muted }),
-            ),
-            Span::styled(
-                value.clone(),
+                field.value.clone(),
                 Style::default().fg(if locked { th.muted } else { th.primary }),
             ),
-            Span::styled(if focused { "▌" } else { "" }, Style::default().fg(th.accent)),
+            Span::styled(if on { "▌" } else { "" }, Style::default().fg(th.accent)),
             Span::styled(
                 if locked {
                     "  from ~/.ssh/config".to_string()
-                } else if value.is_empty() {
+                } else if field.value.is_empty() {
                     format!("  {hint}")
                 } else {
                     String::new()
@@ -571,38 +659,31 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form, th: &Theme) {
         ]));
     }
 
-    // The colour row: a live swatch, the circle the tab will carry, and the
-    // value that will land in config.toml.
-    let focused = form.focus == COLOR_ROW;
-    let tint = form.color.preview(&form.values[0]);
+    // Colour, with a live swatch and the circle the tab will carry.
+    let on = form.focus == form.color_row();
+    let tint = form.color.preview(&form.fields[0].value);
     let shown = match &form.color {
         ColorChoice::Auto => "auto".to_string(),
         ColorChoice::Preset(i) => PALETTE[*i].hex.to_string(),
         ColorChoice::Custom(s) => s.clone(),
     };
     lines.push(Line::from(vec![
-        Span::styled(if focused { " ▌ " } else { "   " }, Style::default().fg(th.accent)),
-        Span::styled(
-            format!("{:<9}", "color"),
-            Style::default().fg(if focused { th.bright } else { th.muted }),
-        ),
+        row_mark(on),
+        label("color", on),
         Span::styled("● ", Style::default().fg(tint.as_ref().map_or(th.faint, |t| t.color))),
         Span::styled(shown, Style::default().fg(th.primary)),
-        Span::styled(if focused { "▌" } else { "" }, Style::default().fg(th.accent)),
+        Span::styled(if on { "▌" } else { "" }, Style::default().fg(th.accent)),
         Span::styled(
             tint.as_ref().map_or(String::new(), |t| format!("   {} tab", t.emoji)),
             Style::default().fg(th.muted),
         ),
-        Span::styled(if focused { "   ←/→ pick" } else { "" }, Style::default().fg(th.faint)),
+        Span::styled(if on { "   ←/→ pick" } else { "" }, Style::default().fg(th.faint)),
     ]));
 
-    let focused = form.focus == HIDDEN_ROW;
+    let on = form.focus == form.hidden_row();
     lines.push(Line::from(vec![
-        Span::styled(if focused { " ▌ " } else { "   " }, Style::default().fg(th.accent)),
-        Span::styled(
-            format!("{:<9}", "hidden"),
-            Style::default().fg(if focused { th.bright } else { th.muted }),
-        ),
+        row_mark(on),
+        label("hidden", on),
         Span::styled(
             if form.hidden { "[on ]" } else { "[off]" },
             Style::default().fg(if form.hidden { th.primary } else { th.faint }),
@@ -611,21 +692,18 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form, th: &Theme) {
             if form.hidden { "   off the home screen" } else { "" },
             Style::default().fg(th.muted),
         ),
-        Span::styled(if focused { "   space toggle" } else { "" }, Style::default().fg(th.faint)),
+        Span::styled(if on { "   space toggle" } else { "" }, Style::default().fg(th.faint)),
     ]));
 
-    let focused = form.focus == OPEN_ROW;
+    let on = form.focus == form.open_row();
     lines.push(Line::from(vec![
-        Span::styled(if focused { " ▌ " } else { "   " }, Style::default().fg(th.accent)),
-        Span::styled(
-            format!("{:<9}", "open in"),
-            Style::default().fg(if focused { th.bright } else { th.muted }),
-        ),
+        row_mark(on),
+        label("open in", on),
         Span::styled(
             form.open_in.map_or("default".to_string(), |o| o.label().to_string()),
             Style::default().fg(th.primary),
         ),
-        Span::styled(if focused { "   ←/→ pick" } else { "" }, Style::default().fg(th.faint)),
+        Span::styled(if on { "   ←/→ pick" } else { "" }, Style::default().fg(th.faint)),
     ]));
 
     lines.push(Line::raw(""));
@@ -640,6 +718,47 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form, th: &Theme) {
             Span::styled("tab/↑↓ field   ⏎ save   esc cancel", Style::default().fg(th.faint)),
         ]),
     });
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The folder picker, shown when a tile has somewhere to start.
+fn draw_folders(f: &mut Frame, area: Rect, label: &str, folders: &[String], sel: usize, th: &Theme) {
+    let rows = folders.len() + 1;
+    let area = modal_area(f, area, 60, rows as u16 + 5);
+    let block = modal_block(&format!("open {label} in"), th);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![Line::raw("")];
+    // Index 0 is always "no folder", so a configured host is never forced
+    // somewhere -- home stays one keystroke away.
+    for (i, item) in std::iter::once(&"~".to_string()).chain(folders).enumerate() {
+        let on = i == sel;
+        let (text, dim) = if i == 0 {
+            ("home".to_string(), "no cd".to_string())
+        } else {
+            let leaf = item.rsplit('/').next().unwrap_or(item).to_string();
+            (leaf, item.clone())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if on { " ▌ " } else { "   " }, Style::default().fg(th.accent)),
+            Span::styled(
+                format!("{} ", if i < 9 { (b'1' + i as u8) as char } else { ' ' }),
+                Style::default().fg(th.faint),
+            ),
+            Span::styled(
+                format!("{text:<18}"),
+                Style::default().fg(if on { th.bright } else { th.primary }),
+            ),
+            Span::styled(dim, Style::default().fg(th.muted)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("   "),
+        Span::styled("↑↓ move   1-9 jump   ⏎ open   esc cancel", Style::default().fg(th.faint)),
+    ]));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -697,6 +816,10 @@ fn draw_confirm(f: &mut Frame, area: Rect, label: &str, reverting: bool, th: &Th
 /// restyles while you type.
 pub enum SettingRow {
     Toggle { key: &'static str, label: &'static str, on: bool },
+    /// The one row that is not in config.toml: it writes the shell rc hook that
+    /// opens the home screen with a terminal. `detail` names the file being
+    /// edited, because that is a bigger thing to do than flipping a flag.
+    Startup { label: &'static str, on: bool, detail: String },
     Choice { key: &'static str, label: &'static str, value: String },
     Color { key: &'static str, label: &'static str, value: String },
 }
@@ -731,6 +854,17 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, focus: usize, buf: &str, 
                     Style::default().fg(if *on { th.primary } else { th.faint }),
                 ));
                 spans.push(Span::styled(label.to_string(), label_style));
+            }
+            SettingRow::Startup { label, on, detail } => {
+                spans.push(Span::styled(
+                    if *on { "[on ] " } else { "[off] " },
+                    Style::default().fg(if *on { th.primary } else { th.faint }),
+                ));
+                spans.push(Span::styled(label.to_string(), label_style));
+                spans.push(Span::styled(
+                    format!("  {detail}"),
+                    Style::default().fg(th.faint),
+                ));
             }
             SettingRow::Choice { label, value, .. } => {
                 spans.push(Span::styled(format!("{label:<24}"), label_style));
