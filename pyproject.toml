@@ -1,0 +1,32 @@
+[build-system]
+# maturin builds the Rust binary and packages it as a wheel whose only payload
+# is a console script. `uv build` drives it; there is no Python code here.
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "dasshboard"
+version = "0.1.0"
+description = "A home screen for Ghostty: clickable SSH hosts that open in colour-coded tabs"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["ssh", "tui", "ghostty", "terminal", "launcher"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Rust",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://pypi.org/project/dasshboard/"
+
+[tool.maturin]
+# The wheel ships the compiled binary as its entry point rather than an
+# importable module, so nothing Python-side is generated.
+bindings = "bin"
+manifest-path = "Cargo.toml"
+strip = true

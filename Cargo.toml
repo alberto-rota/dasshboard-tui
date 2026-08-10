@@ -1,0 +1,20 @@
+[package]
+name = "dasshboard"
+version = "0.1.0"
+edition = "2024"
+description = "A home screen for Ghostty: clickable SSH hosts that open in colour-coded tabs"
+
+[[bin]]
+name = "dasshboard"
+path = "src/main.rs"
+
+[dependencies]
+glob = "0.3"
+ratatui = { version = "0.30", features = ["crossterm"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true
