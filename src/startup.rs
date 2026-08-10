@@ -15,9 +15,13 @@
 //!
 //! Both halves test the same shell function, so they can never disagree about
 //! whether this shell is getting a home screen. That is what keeps herdr
-//! working: a shell dasshboard declines -- inside tmux, an agent, a herdr pane,
-//! not Ghostty -- never has `NO_HSL` set, so the dotfiles decide for
-//! themselves, exactly as they would if dasshboard were not installed.
+//! working: a shell dasshboard declines -- inside tmux, an agent, a herdr pane
+//! -- never has `NO_HSL` set, so the dotfiles decide for themselves, exactly as
+//! they would if dasshboard were not installed.
+//!
+//! The guard asks nothing about *which* terminal this is. It used to insist on
+//! Ghostty, back when a tile could only open a Ghostty tab; a tile that takes
+//! over the terminal it is already in works in any of them.
 
 use std::fs;
 use std::io;
@@ -33,7 +37,7 @@ const MARKERS: [(&str, &str); 2] = [
 
 /// Set in every shell we hand off to, and tested by the guard below, so a shell
 /// spawned *by* dasshboard never opens another one inside itself.
-pub const SKIP_VAR: &str = crate::ghostty::SKIP_VAR;
+pub const SKIP_VAR: &str = crate::launch::SKIP_VAR;
 
 /// Directories part 1 looks in, after the one the hook was written from.
 /// `command -v` is the last resort rather than the first, because at part 1's
@@ -102,8 +106,10 @@ const GUARD: &str = r#"_dasshboard_should_start() {
   # script that happens to source a shell rc.
   case $- in *i*) ;; *) return 1 ;; esac
   [ -z "${SSH_ORIGINAL_COMMAND:-}${SSH_CONNECTION:-}" ] || return 1
-  # Ghostty is the only terminal it can open tabs in.
-  [ "${TERM_PROGRAM:-}" = ghostty ] || return 1
+  # Any terminal will do -- without Ghostty a tile takes over this one instead
+  # of opening a tab, which needs nothing from the terminal at all. Set
+  # DASSHBOARD_ONLY_IN to a TERM_PROGRAM value to keep it to one of them.
+  [ -z "${DASSHBOARD_ONLY_IN:-}" ] || [ "${TERM_PROGRAM:-}" = "$DASSHBOARD_ONLY_IN" ] || return 1
   [ -z "${TMUX:-}" ] || return 1
   # Already inside herdr. Every pane it spawns runs this rc, so without this the
   # first thing a new pane would do is draw a home screen inside itself.
@@ -132,8 +138,8 @@ fn block_one(bin_dir: Option<&str>) -> String {
 # Two details carry the weight:
 #
 #   * conditional -- a shell dasshboard declines (tmux, a herdr pane, an agent,
-#     not Ghostty) never gets NO_HSL, so the dotfiles start herdr there exactly
-#     as they would if dasshboard were not installed;
+#     a non-interactive shell) never gets NO_HSL, so the dotfiles start herdr
+#     there exactly as they would if dasshboard were not installed;
 #   * NOT exported -- hsl-login.sh is sourced by this same shell, so a plain
 #     variable is enough, and it dies with the shell. An exported one would be
 #     inherited by the shell a local tile execs, leaving that shell with the
@@ -202,17 +208,27 @@ impl State {
 
 /// The rc file the hook goes in, from `$SHELL`.
 ///
-/// Only zsh and bash are wired up. Anything else gets an error naming itself
-/// rather than a hook written into a file whose syntax we are guessing at.
+/// Only zsh and bash are wired up, because the hook is POSIX shell and there is
+/// no honest way to write it into a file whose syntax we are guessing at.
+/// Anything else -- fish, and every native Windows shell -- gets an error
+/// naming itself and the one-line manual equivalent instead.
 pub fn rc_path() -> Result<PathBuf, String> {
+    // Git Bash and WSL set $SHELL on Windows too, and their rc files are real
+    // POSIX ones, so the shell is what decides here rather than the platform.
     let shell = std::env::var("SHELL").unwrap_or_default();
     let name = Path::new(&shell).file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let name = name.strip_suffix(".exe").unwrap_or(name);
     match name {
         "zsh" => Ok(match std::env::var_os("ZDOTDIR") {
             Some(d) if !d.is_empty() => PathBuf::from(d).join(".zshrc"),
             _ => home().join(".zshrc"),
         }),
         "bash" => Ok(home().join(".bashrc")),
+        "" if cfg!(windows) => Err(
+            "dasshboard does not edit Windows shell profiles -- add a `dasshboard` line to \
+             the end of your PowerShell profile ($PROFILE) to open it with every terminal"
+                .into(),
+        ),
         "" => Err("$SHELL is not set, so there is no rc file to hook".into()),
         other => Err(format!(
             "dasshboard only knows how to hook zsh and bash, not {other} -- \
@@ -222,7 +238,7 @@ pub fn rc_path() -> Result<PathBuf, String> {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    crate::platform::home()
 }
 
 pub fn state_at(rc: &Path) -> State {
@@ -469,18 +485,23 @@ mod tests {
         assert!(block_two().contains("\"$_DASSHBOARD_BIN\""), "part 2 runs what it found");
     }
 
-    /// The same thing, for real, in the shell: `zsh` with a PATH that does not
-    /// contain the binary -- which is the state part 1 actually runs in.
+    /// Run the generated hook in a real `zsh`, and report what it printed.
     ///
-    /// The tty tests are dropped from the copy under test because cargo's stdout
-    /// is a pipe; every other condition is verbatim.
-    #[test]
-    fn a_hooked_shell_starts_the_home_screen_when_path_is_incomplete() {
+    /// The rc is the shape the blocks are written for: part 1, then a stand-in
+    /// for `hsl-login.sh` sourced by the rc that also completes PATH, then part
+    /// 2. PATH deliberately excludes the binary's directory, because that is
+    /// the state part 1 actually runs in -- a text assertion missed this once
+    /// and a hooked shell came up in the workspace manager instead.
+    ///
+    /// The tty tests are dropped from the copy under test because cargo's
+    /// stdout is a pipe; every other condition is verbatim. `None` means there
+    /// is no zsh here to ask.
+    fn hooked_zsh(name: &str, env: &[(&str, &str)]) -> Option<String> {
         use std::process::Command;
         if Command::new("zsh").arg("-c").arg("exit").status().is_err() {
-            return;
+            return None;
         }
-        let dir = std::env::temp_dir().join("dasshboard-startup-shell");
+        let dir = std::env::temp_dir().join(format!("dasshboard-shell-{name}"));
         let bin = dir.join("bin");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&bin).unwrap();
@@ -491,8 +512,6 @@ mod tests {
             fs::set_permissions(bin.join("dasshboard"), fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        // Part 1, then a stand-in for hsl-login.sh -- sourced last by the rc
-        // that also completes PATH -- then part 2.
         let tty = "  [ -t 0 ] && [ -t 1 ] || return 1\n";
         let one = block_one(bin.to_str());
         assert!(one.contains(tty), "the tty test moved; this test is stale");
@@ -505,8 +524,8 @@ mod tests {
         );
         fs::write(dir.join(".zshrc"), rc).unwrap();
 
-        let out = Command::new("zsh")
-            .arg("-i")
+        let mut cmd = Command::new("zsh");
+        cmd.arg("-i")
             .arg("-c")
             .arg("exit")
             .env_clear()
@@ -514,13 +533,50 @@ mod tests {
             .env("ZDOTDIR", &dir)
             // Deliberately without `bin`: the dotfiles add it too late for part 1.
             .env("PATH", "/usr/bin:/bin")
-            .env("TERM", "xterm-256color")
-            .env("TERM_PROGRAM", "ghostty")
-            .output()
-            .expect("zsh");
-        let text = String::from_utf8_lossy(&out.stdout);
+            .env("TERM", "xterm-256color");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("zsh");
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn a_hooked_shell_starts_the_home_screen_when_path_is_incomplete() {
+        let Some(text) = hooked_zsh("ghostty", &[("TERM_PROGRAM", "ghostty")]) else { return };
         assert!(text.contains("MARK-dasshboard"), "no home screen: {text:?}");
         assert!(!text.contains("MARK-hsl"), "herdr claimed the slot too: {text:?}");
+    }
+
+    /// The guard used to insist on Ghostty, because a tile could only open a
+    /// Ghostty tab. A tile that takes over the terminal it is already in works
+    /// in any of them, so an unknown terminal -- or none at all -- must still
+    /// get the home screen.
+    #[test]
+    fn any_terminal_gets_the_home_screen_now() {
+        for (name, env) in [
+            ("bare", vec![]),
+            ("xterm", vec![("TERM_PROGRAM", "Apple_Terminal")]),
+            ("vscode", vec![("TERM_PROGRAM", "vscode")]),
+        ] {
+            let Some(text) = hooked_zsh(name, &env) else { return };
+            assert!(text.contains("MARK-dasshboard"), "{name}: no home screen: {text:?}");
+        }
+    }
+
+    /// ...and the way back, for one terminal only, without hand-editing a
+    /// block that `--startup on` regenerates.
+    #[test]
+    fn only_in_restricts_the_hook_to_one_terminal() {
+        let only = [("DASSHBOARD_ONLY_IN", "ghostty")];
+        let Some(text) = hooked_zsh("only-in-no", &[only[0], ("TERM_PROGRAM", "vscode")]) else {
+            return;
+        };
+        assert!(!text.contains("MARK-dasshboard"), "should have declined: {text:?}");
+        assert!(text.contains("MARK-hsl"), "declining must hand the slot back: {text:?}");
+
+        let text = hooked_zsh("only-in-yes", &[only[0], ("TERM_PROGRAM", "ghostty")]).unwrap();
+        assert!(text.contains("MARK-dasshboard"), "the named terminal still starts: {text:?}");
     }
 
     /// A fresh rc, and an empty one, both have to work -- no backup to write and

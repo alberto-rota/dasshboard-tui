@@ -2,9 +2,10 @@
 
 [![PyPI](https://img.shields.io/badge/pypi-dasshboard-informational)](https://pypi.org/project/dasshboard/)
 
-A home screen for Ghostty. Every host in `~/.ssh/config` — plus anything you add
-yourself — becomes a clickable tile. Activating one opens a new Ghostty tab
-connected to it, tinted with that host's colour.
+A home screen for your terminal. Every host in `~/.ssh/config` — plus anything
+you add yourself — becomes a clickable tile. Activating one connects: under
+Ghostty on macOS that is a new tab tinted with the host's colour, and in every
+other terminal it takes over the one you are already in.
 
 The whole block is centred in both axes, and tiles keep a fixed width — a wide
 terminal gets whitespace, not vast tiles.
@@ -23,10 +24,58 @@ terminal gets whitespace, not vast tiles.
 
 Two kinds of tile:
 
-- **ssh** — opens a **new Ghostty tab** and connects.
-- **local** (tagged `local`) — **takes over this tab**. termhome restores the
-  terminal and then `exec`s the command, so the process is replaced rather than
-  nested; quitting it returns you to the shell that started termhome.
+- **ssh** — connects to a host.
+- **local** (tagged `local`) — runs a command on this machine.
+
+Both end up in the same three places, chosen by `open_in`: a **new tab**, a
+**new window**, or **this terminal**. Taking over this terminal is the one that
+works everywhere: dasshboard restores the terminal and then hands the session
+the process, so it is replaced rather than nested, and quitting the session
+returns you to the shell that started dasshboard.
+
+## Compatibility
+
+The TUI is portable — it is Rust and [ratatui](https://ratatui.rs), and it draws
+the same picture everywhere. What is *not* portable is opening a **new tab**:
+that needs the terminal to expose an automation interface, and today that means
+Ghostty on macOS. So dasshboard has two levels, and picks between them by
+looking at the terminal it was started in.
+
+| | macOS + Ghostty | any other terminal (macOS, Linux, BSD) | Windows |
+|---|---|---|---|
+| the TUI, mouse, colours | ✅ | ✅ | ✅ |
+| ssh tiles and local tiles | ✅ | ✅ | ✅ |
+| open in **this terminal** | ✅ | ✅ | ✅ |
+| open in a **new tab / window** | ✅ tinted, titled | → this terminal | → this terminal |
+| tab tint + coloured circle | ✅ | — | — |
+| `--startup on` | ✅ zsh, bash | ✅ zsh, bash | by hand, see below |
+
+**Level 1 — macOS running Ghostty ≥ 1.2.** Everything above. `t`/`w`/`c` pick a
+new tab, a new window, or this one; the new surface carries the host's colour as
+a background tint and its circle in the tab title.
+
+**Level 2 — everywhere else.** Every tile opens in the terminal you launched
+dasshboard from, `ssh` replacing the home screen and returning you to your shell
+when it ends. Nothing is silently broken: `tab` and `window` still parse, still
+save, and still travel in a config.toml shared between machines — they simply
+resolve to `current` on a machine that cannot honour them, and the settings
+panel says so. The `t`/`w`/`c` hints disappear from the footer, since there is
+nothing to choose between.
+
+Detection is on the **running** terminal (`TERM_PROGRAM`, or Ghostty's own
+`GHOSTTY_*` variables), not on whether Ghostty is installed — otherwise pressing
+`⏎` in iTerm would answer by opening a tab in a different application. Override
+it with `DASSHBOARD_BACKEND=ghostty` or `DASSHBOARD_BACKEND=inplace` if that
+guess is ever wrong.
+
+What dasshboard asks of a terminal is otherwise ordinary: UTF-8, 24-bit colour
+(it degrades to the nearest 256 in terminals without it), and mouse reporting if
+you want to click tiles. On Windows use [Windows
+Terminal](https://aka.ms/terminal) — `conhost.exe` will run it, but the box
+drawing and the coloured circles are not worth looking at there. `ssh` itself
+comes with Windows 10 1809 and later; `Add-WindowsCapability -Online -Name
+OpenSSH.Client` if it is missing. Hosts are read from `%USERPROFILE%\.ssh\config`,
+which is where OpenSSH for Windows puts them.
 
 ## Colour
 
@@ -88,7 +137,7 @@ rather it didn't, pin that host to another colour.
 | `e` | edit the selected host — including ones from `~/.ssh/config` |
 | `x` | hide the selected host (or unhide it, with `show_hidden` on) |
 | `d` | delete a host, or revert an `~/.ssh/config` one (asks first) |
-| `t` / `w` / `c` | open in a new tab / new window / this surface, once |
+| `t` / `w` / `c` | open in a new tab / new window / this terminal, once (Ghostty only; elsewhere all three mean `c`) |
 | `s` | settings — whether it opens with a terminal, options, destination and both colours |
 | in the picker | `1`-`9` jump, `⏎` open, `esc` cancel |
 | `r` | re-read both config files |
@@ -160,7 +209,7 @@ immediately, so the file and the screen can never disagree.
 ### Customising a host from `~/.ssh/config`
 
 `~/.ssh/config` is **never written to** — it's ssh's file, and rewriting it
-risks the options termhome doesn't model. Instead, editing one of its hosts
+risks the options dasshboard doesn't model. Instead, editing one of its hosts
 creates a `[[host]]` block of the same **name** in `config.toml`, which merges
 on top of it:
 
@@ -215,16 +264,18 @@ editing a hidden host can't silently unhide it.
 `--list` always prints hidden hosts, marked, since it exists to show you what is
 actually configured.
 
-Everything lands in `~/.config/dasshboard/config.toml`, created with a
-commented template on first run:
+Everything lands in `~/.config/dasshboard/config.toml` — `$XDG_CONFIG_HOME` if
+you set it, and `%APPDATA%\dasshboard\config.toml` on Windows — created with a
+commented template on first run. `dasshboard --config` prints the path this
+machine chose:
 
 ```toml
 [options]
 include_ssh_config = true   # false shows only the hosts defined here
-tint_tabs = true            # tint the new tab's background
-tab_emoji = true            # coloured circle in the tab title
+tint_tabs = true            # tint the new tab's background (Ghostty only)
+tab_emoji = true            # coloured circle in the tab title (Ghostty only)
 show_hidden = false         # reveal hidden hosts, to unhide them
-open_in = "tab"             # "tab", "window" or "current"
+open_in = "tab"             # "tab", "window" or "current"; "current" elsewhere
 
 [theme]
 primary = "#aaaaaa"
@@ -256,7 +307,27 @@ and a local tile may share a name without colliding.
 A TOML syntax error is reported in the status line and leaves the previous
 screen usable; a typo must never cost you the home screen.
 
-## How tabs are opened
+## How a session is opened
+
+Two paths, and `src/launch.rs` is the whole of the decision between them —
+`src/ghostty.rs` is the only module that knows Ghostty exists, and nothing
+reaches it unless Ghostty is the terminal we are running in.
+
+### In this terminal — everywhere
+
+The TUI is torn down first (alternate screen off, raw mode off), and only then
+does the session start, so it comes up on a clean screen owning the terminal
+outright. On Unix that is a real `exec`: dasshboard *becomes* ssh, leaving no
+wrapper process holding the tty, and when the connection ends the shell that
+launched dasshboard is what you land back in. Windows has no `exec`, so there
+the session runs as a child on the same console and dasshboard exits with its
+status — the only difference is a sleeping parent behind it.
+
+`DASSHBOARD_SKIP=1` is exported across the handoff. A local tile usually runs a
+shell, that shell reads the same rc that started dasshboard, and without the
+flag the first thing it would do is draw a second home screen inside the first.
+
+### In a new Ghostty tab — macOS
 
 Ghostty ≥ 1.2 ships an AppleScript dictionary, so no key-injection hacks:
 
@@ -295,7 +366,7 @@ since they configure other hosts rather than naming one, and `Match` blocks end
 the current host so their conditional keys aren't misattributed.
 
 Hosts from `~/.ssh/config` are launched by **alias alone**, so ssh re-reads the
-same file and every option termhome doesn't model — `IdentityFile`,
+same file and every option dasshboard doesn't model — `IdentityFile`,
 `ForwardX11`, `IdentitiesOnly` — still applies. Overrides preserve that by
 riding in as `-o Key=Value` before the alias rather than replacing it.
 
@@ -322,6 +393,24 @@ as the upgrade path for an older hook, and `off` removes exactly what it added �
 your rc comes back byte-identical, which is what hands the terminal-open slot
 back to whatever had it.
 
+Only zsh and bash are written to, because the hook is POSIX shell and there is
+no honest way to write it into a file whose syntax we would be guessing at.
+**fish** and every native Windows shell get an error naming themselves instead.
+On Windows the equivalent is one line at the end of your PowerShell profile
+(`notepad $PROFILE`), guarded so a shell dasshboard launched doesn't draw a
+second home screen inside itself:
+
+```powershell
+if (-not $env:DASSHBOARD_SKIP) { dasshboard }
+```
+
+The guard asks **nothing about which terminal this is** — it used to insist on
+Ghostty, back when a tile could only open a Ghostty tab, but a tile that takes
+over the terminal it is already in works in all of them. To keep it to one
+terminal anyway, set `DASSHBOARD_ONLY_IN` to a `TERM_PROGRAM` value (e.g.
+`export DASSHBOARD_ONLY_IN=ghostty`) above the hook; the generated block tests
+it, so this survives the next `--startup on`.
+
 The split into two blocks is forced by *when* each half must run.
 `hsl-login.sh` is sourced as the last act of the dotfiles' rc and **blocks**
 until you quit herdr, so anything after it never reaches the screen: part 1 goes
@@ -331,8 +420,8 @@ Both halves ask the same shell function, and that is the load-bearing part:
 
 - **`NO_HSL=1` is conditional.** Part 1 sets `hsl-login.sh`'s own escape hatch
   only in a shell dasshboard is actually going to draw in. Every shell it
-  declines — inside tmux, a herdr pane, an agent, not Ghostty — gets herdr
-  exactly as if dasshboard were not installed. An unconditional `export` here
+  declines — inside tmux, a herdr pane, an agent, a non-interactive shell — gets
+  herdr exactly as if dasshboard were not installed. An unconditional `export` here
   suppressed the workspace manager machine-wide, which is the bug this shape
   fixes.
 - **and unexported.** `hsl-login.sh` is *sourced* by the same shell, so a plain
@@ -388,10 +477,13 @@ uv build          # -> dist/*.whl and dist/*.tar.gz
 uv publish        # needs a PyPI token
 ```
 
-The wheel is tagged `macosx_11_0_arm64`, because the whole thing talks to
-Ghostty over AppleScript. On any other platform pip will fall back to the sdist
-and build from source, which works if you have a Rust toolchain but still needs
-macOS and Ghostty to be useful.
+Built here, the wheel comes out tagged `macosx_11_0_arm64` — maturin tags what
+it built, not what the code supports. There is nothing macOS-only left in the
+source, so the same `uv build` on a Linux or Windows runner (or under
+[`maturin` in a container](https://www.maturin.rs/distribution)) produces a
+wheel for that platform. Until those are published, `pip` falls back to the
+sdist on anything else and builds from source, which needs a Rust toolchain but
+otherwise works: see [Compatibility](#compatibility) for what you get.
 
 ## Development
 
@@ -400,10 +492,25 @@ cargo build --release        # ~/.local/bin/dasshboard symlinks to the output
 cargo test                   # parsing, escaping, colour assignment, layout
 cargo test layout_dump -- --nocapture   # eyeball every screen at four sizes
 ./target/release/dasshboard --list      # tiles, colours and circles, no TUI
-./target/release/dasshboard --open alex # spawn one tab, no TUI
+./target/release/dasshboard --open alex # connect to one host, no TUI
 ./target/release/dasshboard --config    # print the config path
 ./target/release/dasshboard --startup   # is it hooked into the shell rc?
 ```
+
+Portability is checked without leaving the Mac. `cargo check` links nothing, so
+a target's std library is all it needs:
+
+```sh
+rustup target add x86_64-pc-windows-msvc x86_64-unknown-linux-gnu
+cargo check --all-targets --target x86_64-pc-windows-msvc
+cargo check --all-targets --target x86_64-unknown-linux-gnu
+DASSHBOARD_BACKEND=inplace cargo test layout_dump -- --nocapture   # the other screen
+```
+
+`src/platform.rs` is where the differences live — home directory, hostname,
+executable bit, `PATH` — so the rest of the tree never has to have a `cfg!` in
+it. The two that cannot be abstracted are marked: the `exec`/spawn split in
+`main.rs::hand_off`, and `src/ghostty.rs` as a whole.
 
 `src/startup.rs` owns the rc hook and its tests run against a scratch file, so
 they never touch your real `~/.zshrc`:
@@ -412,7 +519,15 @@ they never touch your real `~/.zshrc`:
 `no_hsl_is_conditional_and_unexported` pins the two properties that keep herdr
 working. `a_hooked_shell_starts_the_home_screen_when_path_is_incomplete` runs
 the generated blocks in a real `zsh` with the binary deliberately off PATH,
-which is the state part 1 actually runs in and the one a text assertion missed.
+which is the state part 1 actually runs in and the one a text assertion missed;
+`any_terminal_gets_the_home_screen_now` and
+`only_in_restricts_the_hook_to_one_terminal` run the same shell for the guard's
+terminal policy.
+
+`without_a_spawner_every_destination_becomes_a_handoff` is the portability
+promise in one assertion: with no way to open a tab, a tile that asks for one
+lands in this terminal rather than reaching the AppleScript backend and failing
+there.
 
 The binary is symlinked rather than copied, so `cargo build --release` takes
 effect immediately. Don't `cargo clean` without rebuilding.

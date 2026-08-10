@@ -9,11 +9,11 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 
 use crate::entry::{self, Entry};
-use crate::ghostty;
+use crate::launch::{self, Backend};
 use crate::config::{Block, Draft, OpenIn};
 use crate::theme::Theme;
 use crate::ui::{ACCENT_PRESETS, ColorChoice, Form, KIND_ROW, PRIMARY_PRESETS, SettingRow};
-use crate::{config, ssh, startup};
+use crate::{config, platform, ssh, startup};
 
 pub enum Mode {
     Browse,
@@ -32,8 +32,8 @@ pub enum Mode {
 /// `~/.zshrc` rather than `/Users/albe/.zshrc`: a settings row has 56 columns.
 fn short_home(p: &std::path::Path) -> String {
     let s = p.display().to_string();
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
+    match platform::home().to_str() {
+        Some(h) if !h.is_empty() && s.starts_with(h) => format!("~{}", &s[h.len()..]),
         _ => s,
     }
 }
@@ -71,6 +71,9 @@ pub struct App {
     /// Whether the shell rc opens the home screen with a terminal. Lives in the
     /// rc, not config.toml, so it is read on load rather than every frame.
     pub startup: startup::State,
+    /// What this terminal can do with a session. Read once: it is a property of
+    /// the environment we were started in, which cannot change under us.
+    pub backend: Backend,
 }
 
 impl App {
@@ -96,6 +99,7 @@ impl App {
             open_in: OpenIn::Tab,
             theme: Theme::default(),
             startup: startup::State::Off,
+            backend: launch::backend(),
         };
         app.load(false);
         app
@@ -138,6 +142,11 @@ impl App {
     }
 
     pub fn setting_rows(&self) -> Vec<SettingRow> {
+        // Three rows describe something only a tab-opening terminal can do.
+        // They stay visible and stay editable -- a config is often written on
+        // one machine and read on another -- but they say when they are inert
+        // here rather than pretending to work.
+        let inert = self.backend.note();
         vec![
             // First, because it is the only one that changes what happens
             // outside this process -- and it starts off.
@@ -153,26 +162,34 @@ impl App {
                 key: "include_ssh_config",
                 label: "show hosts from ~/.ssh/config",
                 on: self.include_ssh_config,
+                note: "",
             },
             SettingRow::Toggle {
                 key: "tint_tabs",
                 label: "tint the new tab's background",
                 on: self.tint_tabs,
+                note: inert,
             },
             SettingRow::Toggle {
                 key: "tab_emoji",
                 label: "coloured circle in the tab title",
                 on: self.tab_emoji,
+                note: inert,
             },
             SettingRow::Toggle {
                 key: "show_hidden",
                 label: "reveal hidden hosts",
                 on: self.show_hidden,
+                note: "",
             },
             SettingRow::Choice {
                 key: "open_in",
                 label: "open sessions in",
+                // The stored value, not the resolved one: the row has to agree
+                // with what the arrows are cycling through, and the note is
+                // what says the answer lands here regardless.
                 value: self.open_in.label().to_string(),
+                note: if self.backend.can_spawn() { "" } else { "opens here" },
             },
             SettingRow::Color {
                 key: "primary",
@@ -245,7 +262,10 @@ impl App {
 
     fn launch(&mut self, ei: usize, dir: Option<&str>, force: Option<OpenIn>) {
         let e = &self.entries[ei];
-        let where_to = force.or(e.open_in).unwrap_or(self.open_in);
+        // The tile asks; the terminal answers. Where new surfaces are not
+        // available every destination collapses to "here", so a config written
+        // on a Mac still opens the right host on a Linux or Windows box.
+        let where_to = self.backend.resolve(force.or(e.open_in).unwrap_or(self.open_in));
         let label = e.label.clone();
         let argv = e.argv_in(dir);
         let cwd = e.local_cwd(dir);
@@ -262,7 +282,7 @@ impl App {
             self.quit = true;
             return;
         }
-        match ghostty::open(where_to, &label, &argv, cwd.as_deref(), tint.as_deref(), emoji) {
+        match launch::spawn(where_to, &label, &argv, cwd.as_deref(), tint.as_deref(), emoji) {
             Ok(_) => self.say(format!("opened {where_text} — {label}"), true),
             Err(e) => self.say(e, false),
         }

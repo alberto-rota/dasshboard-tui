@@ -254,24 +254,13 @@ impl Entry {
     }
 }
 
-/// Wrap in single quotes for a POSIX shell -- here, the *remote* one.
-/// Resolve a leading `~` against `$HOME`, for a path this machine will read.
+/// Resolve a leading `~` against the home directory, for a path this machine
+/// will read.
 ///
 /// Nothing downstream does it for us: a local folder becomes either a real
 /// `chdir` or a `cd` inside single quotes, and neither expands a tilde -- which
-/// is why `folders = ["~/Desktop"]` reported that the folder did not exist. Only
-/// a *leading* tilde, and only `~` or `~/...`: mid-path tildes are literal in a
-/// shell too, and `~user` needs a passwd lookup we would only get half right.
-pub fn expand_home(dir: &str) -> String {
-    let Some(rest) = dir.strip_prefix('~') else { return dir.to_string() };
-    if !(rest.is_empty() || rest.starts_with('/')) {
-        return dir.to_string();
-    }
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => format!("{}{rest}", home.trim_end_matches('/')),
-        _ => dir.to_string(),
-    }
-}
+/// is why `folders = ["~/Desktop"]` reported that the folder did not exist.
+pub use crate::platform::expand_home;
 
 /// Quote a path for a shell, leaving a leading `~` for that shell to expand.
 ///
@@ -297,6 +286,46 @@ fn sh_quote(s: &str) -> String {
         if c == '\'' { out.push_str("'\\''") } else { out.push(c) }
     }
     out.push('\'');
+    out
+}
+
+/// Split a configured `command` into argv.
+///
+/// Whitespace separates arguments, so `zsh -l` is two of them, but a quoted run
+/// stays one word -- which is what makes a Windows program reachable at all,
+/// since the usual place for one is under `C:\Program Files`. Quotes are the
+/// whole of the grammar: nothing here is ever handed back to a shell to
+/// re-parse, so there is no expansion to model and no injection to prevent.
+fn split_command(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+
+    for c in command.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                // An empty quoted word is still a word: `""` is an argument.
+                started = true;
+                quote = Some(c);
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                started = true;
+                word.push(c);
+            }
+        }
+    }
+    if started {
+        out.push(word);
+    }
     out
 }
 
@@ -414,9 +443,7 @@ pub fn build(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
             label: l.label.clone(),
             detail: l.detail.clone(),
             jump: None,
-            // Split on whitespace so `zsh -l` works, but nothing is re-parsed
-            // by a shell later.
-            argv: l.command.split_whitespace().map(String::from).collect(),
+            argv: split_command(&l.command),
             kind: Kind::Local,
             origin: None,
             hidden: l.hidden,
@@ -481,6 +508,28 @@ mod tests {
             open_in: None,
             folders: Vec::new(),
         })
+    }
+
+    /// `zsh -l` has to be two arguments, and a Windows program has to survive
+    /// living under `C:\Program Files` -- which needs quotes to mean something.
+    #[test]
+    fn a_command_splits_on_spaces_unless_they_are_quoted() {
+        let split = |s: &str| split_command(s);
+        assert_eq!(split("/bin/zsh -l"), ["/bin/zsh", "-l"]);
+        assert_eq!(split("  /bin/zsh   -l  "), ["/bin/zsh", "-l"], "runs of space are one break");
+        assert_eq!(split(""), Vec::<String>::new());
+        assert_eq!(
+            split(r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo"#),
+            [r"C:\Program Files\PowerShell\7\pwsh.exe", "-NoLogo"]
+        );
+        assert_eq!(split("'/usr/local/my tools/sh'"), ["/usr/local/my tools/sh"]);
+        // Quotes delimit; they are not part of the argument, and they may open
+        // and close mid-word.
+        assert_eq!(split(r#"ssh -o "User=a b" host"#), ["ssh", "-o", "User=a b", "host"]);
+        assert_eq!(split(r#"a"b c"d"#), ["ab cd"]);
+        // An unterminated quote yields the rest as one word rather than
+        // dropping it: a tile that still runs beats a tile that vanishes.
+        assert_eq!(split(r#"cmd "unclosed arg"#), ["cmd", "unclosed arg"]);
     }
 
     #[test]

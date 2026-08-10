@@ -77,7 +77,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Add(form) | Mode::Edit(form) => {
             dim_behind(f, full, th);
-            draw_form(f, full, form, th);
+            draw_form(f, full, form, app.backend.can_spawn(), th);
         }
         Mode::ConfirmDelete(i) => {
             dim_behind(f, full, th);
@@ -336,16 +336,23 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
             Span::styled("▌", Style::default().fg(th.accent)),
             Span::styled("    ⏎ open   esc cancel", Style::default().fg(th.faint)),
         ]),
-        Mode::Browse => key_hints(th, &[
-            ("⏎", "open"),
-            ("t/w/c", "tab·win·here"),
-            ("/", "find"),
-            ("a", "add"),
-            ("e", "edit"),
-            ("x", "hide"),
-            ("s", "settings"),
-            ("q", "shell"),
-        ]),
+        Mode::Browse => {
+            // The destination keys are only advertised where there is a choice
+            // to make: with nothing able to open a tab, t/w/c all mean ⏎.
+            let mut hints = vec![("⏎", "open")];
+            if app.backend.can_spawn() {
+                hints.push(("t/w/c", "tab·win·here"));
+            }
+            hints.extend([
+                ("/", "find"),
+                ("a", "add"),
+                ("e", "edit"),
+                ("x", "hide"),
+                ("s", "settings"),
+                ("q", "shell"),
+            ]);
+            key_hints(th, &hints)
+        }
         _ => Line::raw(""),
     };
 
@@ -576,7 +583,7 @@ impl Form {
     }
 }
 
-fn draw_form(f: &mut Frame, area: Rect, form: &Form, th: &Theme) {
+fn draw_form(f: &mut Frame, area: Rect, form: &Form, spawns: bool, th: &Theme) {
     let title = match &form.editing {
         Some(n) => format!("edit {n}"),
         None => "add".to_string(),
@@ -703,6 +710,12 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form, th: &Theme) {
             form.open_in.map_or("default".to_string(), |o| o.label().to_string()),
             Style::default().fg(th.primary),
         ),
+        // The value is still written and still travels with the config; it just
+        // cannot be honoured by the terminal reading it right now.
+        Span::styled(
+            if spawns { "" } else { "  opens here" },
+            Style::default().fg(th.faint),
+        ),
         Span::styled(if on { "   ←/→ pick" } else { "" }, Style::default().fg(th.faint)),
     ]));
 
@@ -814,14 +827,25 @@ fn draw_confirm(f: &mut Frame, area: Rect, label: &str, reverting: bool, th: &Th
 /// A row in the settings panel. Toggles write through on the keystroke;
 /// colours write as soon as what you have typed is a valid hex, so the whole UI
 /// restyles while you type.
+///
+/// `note` is for a row that is real but inert on this machine -- a tab tint
+/// where nothing can open a tab. Those rows stay editable rather than
+/// disappearing, since a config is often written on one machine and read on
+/// another; the note is how the screen stays honest about it.
 pub enum SettingRow {
-    Toggle { key: &'static str, label: &'static str, on: bool },
+    Toggle { key: &'static str, label: &'static str, on: bool, note: &'static str },
     /// The one row that is not in config.toml: it writes the shell rc hook that
     /// opens the home screen with a terminal. `detail` names the file being
     /// edited, because that is a bigger thing to do than flipping a flag.
     Startup { label: &'static str, on: bool, detail: String },
-    Choice { key: &'static str, label: &'static str, value: String },
+    Choice { key: &'static str, label: &'static str, value: String, note: &'static str },
     Color { key: &'static str, label: &'static str, value: String },
+}
+
+/// A note is set off from the value it qualifies, and takes no room at all when
+/// there is nothing to say.
+fn dim_note(note: &str) -> String {
+    if note.is_empty() { String::new() } else { format!("  {note}") }
 }
 
 /// Cycled by the arrows on a colour row; typing overrides them.
@@ -832,7 +856,10 @@ pub const ACCENT_PRESETS: [&str; 6] =
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App, focus: usize, buf: &str, th: &Theme) {
     let rows = app.setting_rows();
-    let area = modal_area(f, area, 56, rows.len() as u16 + 5);
+    // The same width as the form: a row here can carry a label, a value and a
+    // note saying the value is inert on this machine, which is one field more
+    // than the panel was originally sized for.
+    let area = modal_area(f, area, 62, rows.len() as u16 + 5);
     let block = modal_block("settings", th);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -848,12 +875,13 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, focus: usize, buf: &str, 
 
         let mut spans = vec![mark];
         match row {
-            SettingRow::Toggle { label, on, .. } => {
+            SettingRow::Toggle { label, on, note, .. } => {
                 spans.push(Span::styled(
                     if *on { "[on ] " } else { "[off] " },
                     Style::default().fg(if *on { th.primary } else { th.faint }),
                 ));
                 spans.push(Span::styled(label.to_string(), label_style));
+                spans.push(Span::styled(dim_note(note), Style::default().fg(th.faint)));
             }
             SettingRow::Startup { label, on, detail } => {
                 spans.push(Span::styled(
@@ -866,9 +894,10 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, focus: usize, buf: &str, 
                     Style::default().fg(th.faint),
                 ));
             }
-            SettingRow::Choice { label, value, .. } => {
+            SettingRow::Choice { label, value, note, .. } => {
                 spans.push(Span::styled(format!("{label:<24}"), label_style));
                 spans.push(Span::styled(value.clone(), Style::default().fg(th.primary)));
+                spans.push(Span::styled(dim_note(note), Style::default().fg(th.faint)));
                 if on_this {
                     spans.push(Span::styled("   ←/→", Style::default().fg(th.faint)));
                 }

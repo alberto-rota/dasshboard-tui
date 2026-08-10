@@ -1,5 +1,10 @@
 //! Opens new Ghostty tabs via its AppleScript interface (Ghostty >= 1.2).
 //!
+//! The one part of dasshboard that is not portable, and the only module that
+//! knows Ghostty exists: `launch` picks it when -- and only when -- we are
+//! running on macOS under Ghostty, and hands everything else to the terminal we
+//! are already in. Nothing here is reached on Linux or Windows.
+//!
 //! Two quirks worth recording, both found by probing the running app:
 //!
 //!  * `new tab` errors with -1708 unless the optional `in <window>` parameter is
@@ -11,6 +16,7 @@
 use std::process::Command;
 
 use crate::config::OpenIn;
+use crate::launch::SKIP_VAR;
 
 /// Wrap in single quotes for `/bin/sh`.
 fn shell_quote(s: &str) -> String {
@@ -146,9 +152,6 @@ pub fn open(
         guard = applescript_quote(&format!("{SKIP_VAR}=1")),
     ))
 }
-
-/// Set in every surface we spawn, and checked by the shell rc that starts us.
-pub const SKIP_VAR: &str = "DASSHBOARD_SKIP";
 
 fn run_applescript(script: &str) -> Result<String, String> {
     let out = Command::new("osascript")

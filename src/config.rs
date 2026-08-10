@@ -10,16 +10,23 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::platform;
+
 /// Where activating a tile puts the new session.
+///
+/// A request, not a promise: only a terminal that can be driven from outside
+/// (Ghostty on macOS) can honour the first two, and `launch::Backend::resolve`
+/// collapses them to `Current` everywhere else. They are still worth storing --
+/// the same config.toml is read on more than one machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenIn {
-    /// A new Ghostty tab.
+    /// A new terminal tab.
     #[default]
     Tab,
-    /// A new Ghostty window.
+    /// A new terminal window.
     Window,
-    /// This surface, replacing the home screen.
+    /// This terminal, replacing the home screen.
     Current,
 }
 
@@ -223,10 +230,19 @@ pub fn dir() -> PathBuf {
     config_base().join("dasshboard")
 }
 
+/// `$XDG_CONFIG_HOME` if it is set -- it is the explicit answer, and people who
+/// set it mean it. Then `%APPDATA%` on Windows, which is where a Windows
+/// program is expected to keep its settings, and `~/.config` everywhere else.
 fn config_base() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"))
+    if let Some(v) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(v);
+    }
+    if cfg!(windows) {
+        if let Some(v) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+            return PathBuf::from(v);
+        }
+    }
+    home().join(".config")
 }
 
 /// Move a config written under the old name, once, so the rename doesn't look
@@ -244,23 +260,6 @@ pub fn path() -> PathBuf {
     dir().join("config.toml")
 }
 
-/// The short host name, for the local tile's label. Falls back rather than
-/// failing: a launcher must still come up on a machine with no `hostname`.
-fn machine_name() -> String {
-    std::process::Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "local".into())
-}
-
-fn login_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
-}
-
 /// The workspace manager, if this machine has one: `hsl` (herdr plus its status
 /// line) before plain `herdr`, the same order and for the same reason as the
 /// dotfiles' own `hsl-login.sh`.
@@ -271,28 +270,19 @@ fn login_shell() -> String {
 /// searched even when PATH has not caught up with it yet, which is exactly the
 /// state a first run is in.
 fn workspace_manager() -> Option<(String, PathBuf)> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    let dirs = path
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .chain(std::iter::once(home().join(".local/bin")));
-    let dirs: Vec<PathBuf> = dirs.collect();
     for name in ["hsl", "herdr"] {
-        if let Some(p) = dirs.iter().map(|d| d.join(name)).find(|p| is_executable(p)) {
+        let local_bin = home().join(".local/bin").join(name);
+        let found =
+            platform::which(name).or_else(|| platform::is_executable(&local_bin).then_some(local_bin));
+        if let Some(p) = found {
             return Some((name.to_string(), p));
         }
     }
     None
 }
 
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    platform::home()
 }
 
 /// Load the config, writing a starter file the first time. A parse error is
@@ -349,14 +339,15 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
     // over this tab rather than opening another one.
     let (detail, command) = match workspace_manager() {
         Some((name, path)) => (format!("{name} · workspace manager"), path.display().to_string()),
-        None => ("local shell".to_string(), login_shell()),
+        None => ("local shell".to_string(), platform::login_shell()),
     };
     s.push_str(&format!(
         "# Local tiles run a command on this machine. `open_in` decides where:\n\
          # a new tab, a new window, or \"current\" to take over this one.\n\
+         # Outside Ghostty on macOS every tile opens in the current terminal.\n\
          [[local]]\nlabel = {:?}\ndetail = {detail:?}\ncommand = {command:?}\n\
          open_in = \"current\"\n\n",
-        machine_name(),
+        platform::machine_name(),
     ));
 
     s.push_str(

@@ -26,9 +26,11 @@ impl Host {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    crate::platform::home()
 }
 
+/// `~/.ssh/config` on every platform: OpenSSH on Windows reads
+/// `%USERPROFILE%\.ssh\config`, which is the same place under a different name.
 pub fn default_config_path() -> PathBuf {
     home().join(".ssh").join("config")
 }

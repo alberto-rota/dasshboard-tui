@@ -1,21 +1,25 @@
-//! dasshboard -- a home screen for Ghostty.
+//! dasshboard -- a home screen for your terminal.
 //!
 //! Draws every host in `~/.ssh/config` plus anything in `config.toml` as a
-//! clickable tile. SSH hosts open in a new Ghostty tab tinted with the host's
-//! colour; local tiles take over the tab you are already in. Quitting drops you
-//! into the shell that launched it.
+//! clickable tile. Activating one connects: under Ghostty on macOS that is a
+//! new tab tinted with the host's colour, and everywhere else it takes over the
+//! terminal you are already in. Quitting drops you into the shell that launched
+//! it.
+//!
+//! Nothing outside `ghostty.rs` knows Ghostty exists -- see `launch.rs`.
 
 mod app;
 mod config;
 mod entry;
 mod ghostty;
+mod launch;
+mod platform;
 mod ssh;
 mod startup;
 mod theme;
 mod ui;
 
 use std::io::{self, Stdout};
-use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::Duration;
 
@@ -43,26 +47,56 @@ fn main() -> io::Result<()> {
     res?;
 
     // Only reached once the terminal is back to normal, so the handed-off
-    // program starts on a clean screen and owns this tab from here on.
+    // program starts on a clean screen and owns this terminal from here on.
     if let Some(argv) = app.handoff {
-        if let Some(dir) = &app.handoff_cwd {
-            if let Err(e) = std::env::set_current_dir(dir) {
-                eprintln!("dasshboard: could not enter {dir}: {e}");
-                std::process::exit(1);
-            }
-        }
-        // A local tile usually execs a shell, and that shell reads the same rc
-        // that started us. Without this it would draw a second home screen
-        // inside the first; with it, the rc's guard declines -- which is also
-        // what lets the dotfiles start herdr in that shell.
-        let err = Command::new(&argv[0])
-            .args(&argv[1..])
-            .env(ghostty::SKIP_VAR, "1")
-            .exec();
-        eprintln!("dasshboard: could not exec {}: {err}", argv[0]);
-        std::process::exit(1);
+        hand_off(&argv, app.handoff_cwd.as_deref());
     }
     Ok(())
+}
+
+/// Give this terminal to `argv` and never come back.
+///
+/// The session dasshboard was asked for *replaces* the home screen rather than
+/// running under it, which is what makes the same launcher work in a terminal
+/// that cannot open tabs for us: there is no nesting, no wrapper process left
+/// holding the tty, and quitting the session falls through to the shell that
+/// started dasshboard.
+///
+/// `SKIP_VAR` goes into the environment because a local tile usually runs a
+/// shell, and that shell reads the same rc that started us -- without it, the
+/// first thing it would do is draw a second home screen inside the first.
+fn hand_off(argv: &[String], cwd: Option<&str>) -> ! {
+    if let Some(dir) = cwd {
+        if let Err(e) = std::env::set_current_dir(dir) {
+            eprintln!("dasshboard: could not enter {dir}: {e}");
+            std::process::exit(1);
+        }
+    }
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]).env(launch::SKIP_VAR, "1");
+
+    // Unix replaces this process outright, so nothing of dasshboard survives to
+    // be waited on.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        eprintln!("dasshboard: could not run {}: {err}", argv[0]);
+        std::process::exit(1);
+    }
+
+    // Windows has no exec, so the nearest thing is to run the session as a
+    // child on the same console and then leave with its exit code. The console,
+    // the keyboard and the scrollback are all still the session's alone; the
+    // only difference is a parent process asleep behind it.
+    #[cfg(not(unix))]
+    match cmd.status() {
+        Ok(st) => std::process::exit(st.code().unwrap_or(0)),
+        Err(e) => {
+            eprintln!("dasshboard: could not run {}: {e}", argv[0]);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Non-TUI entry points. Returns `Some(exit_code)` when one of them ran.
@@ -114,7 +148,13 @@ fn run_cli() -> io::Result<Option<i32>> {
             } else {
                 where_to
             };
-            match ghostty::open(where_to, &name, &argv, None, hex.as_deref(), emoji) {
+            // Without a terminal that opens tabs for us there is nowhere else to
+            // put it, so `--open` becomes what it means in a shell: connect,
+            // here, in place of this command.
+            if !launch::backend().can_spawn() {
+                hand_off(&argv, None);
+            }
+            match launch::spawn(where_to, &name, &argv, None, hex.as_deref(), emoji) {
                 Ok(id) => {
                     println!("{id}");
                     Ok(Some(0))
@@ -133,13 +173,23 @@ fn run_cli() -> io::Result<Option<i32>> {
         // home screen gets to open with a terminal, and how it stops.
         "--startup" => Ok(Some(startup_cli(args.next().as_deref()))),
         "--help" | "-h" => {
+            let where_to = match launch::backend() {
+                launch::Backend::Ghostty => "new Ghostty tabs",
+                launch::Backend::InPlace => "this terminal (no tabs: needs Ghostty on macOS)",
+            };
             println!(
                 "dasshboard [--list | --open <host> | --config | --startup [on|off] | --help]\n\n\
                  With no arguments, launches the TUI.\n\n\
+                 --list               print every tile, colours included, and exit\n\
+                 --open <host>        connect to one host without the TUI\n\
+                 --config             print the path of config.toml\n\
                  --startup            report whether the home screen opens with a terminal\n\
                  --startup on         hook it into your shell rc (opt in; nothing else does this)\n\
                  --startup off        unhook it, restoring whatever owned that slot before\n\
-                 --startup print      print the hook instead of writing it"
+                 --startup print      print the hook instead of writing it\n\n\
+                 Sessions open in: {where_to}.\n\
+                 Set {} to ghostty or inplace to override that.",
+                launch::BACKEND_VAR,
             );
             Ok(Some(0))
         }
@@ -422,6 +472,34 @@ mod tests {
         no_folders(&mut app);
         app.activate_in(&vis, Some(OpenIn::Current));
         assert!(app.handoff.is_some(), "the one-off key wins");
+    }
+
+    /// The whole of the portability promise, in one assertion: on a machine
+    /// with nothing to open a tab *with*, a tile that asks for one lands in
+    /// this terminal instead. Without this, `t` on Linux would reach the
+    /// AppleScript backend and fail there rather than doing the obvious thing.
+    #[test]
+    fn without_a_spawner_every_destination_becomes_a_handoff() {
+        use config::OpenIn;
+        use launch::Backend;
+        let mut app = App::new();
+        app.backend = Backend::InPlace;
+        let Some(i) = app.entries.iter().position(|e| !e.hidden() && !e.argv.is_empty()) else {
+            return;
+        };
+        // A tile with folders asks which one first, which is a different
+        // question from where it opens.
+        app.entries[i].folders.clear();
+        app.entries[i].open_in = Some(OpenIn::Window);
+        let vis = app.visible();
+        app.sel = vis.iter().position(|&x| x == i).unwrap();
+        let argv = app.entries[i].argv.clone();
+
+        // Both the tile's own setting and a one-off `t` ask for a new surface.
+        app.activate_in(&vis, Some(OpenIn::Tab));
+        assert!(app.quit, "must leave the TUI rather than report a failure");
+        assert_eq!(app.handoff.as_deref(), Some(argv.as_slice()));
+        assert!(app.status.is_none(), "a handoff is not a spawned tab");
     }
 
     fn press(app: &mut App, code: ratatui::crossterm::event::KeyCode) {

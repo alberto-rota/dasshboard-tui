@@ -2,7 +2,7 @@
 name = "dasshboard"
 version = "0.2.0"
 edition = "2024"
-description = "A home screen for Ghostty: clickable SSH hosts that open in colour-coded tabs"
+description = "A home screen for your terminal: clickable SSH hosts, in colour-coded Ghostty tabs on macOS and in the current terminal everywhere else"
 
 [[bin]]
 name = "dasshboard"

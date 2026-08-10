@@ -7,17 +7,28 @@ build-backend = "maturin"
 [project]
 name = "dasshboard"
 version = "0.2.0"
-description = "A home screen for Ghostty: clickable SSH hosts that open in colour-coded tabs"
+description = "A home screen for your terminal: clickable SSH hosts, in colour-coded Ghostty tabs on macOS and in the current terminal everywhere else"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
-keywords = ["ssh", "tui", "ghostty", "terminal", "launcher"]
+keywords = ["ssh", "tui", "ghostty", "terminal", "launcher", "cross-platform"]
+# The TUI and both kinds of tile run everywhere. Only *new tabs* need macOS and
+# Ghostty; a tile asking for one opens in the current terminal instead, which is
+# why this is OS Independent with the three it is actually tested on named
+# after it. The Compatibility table in the README -- which is this page on PyPI
+# -- is the long form.
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Rust",
     "Topic :: Terminals",
+    "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
 
