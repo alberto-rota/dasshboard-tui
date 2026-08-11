@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 
 use crate::entry::{self, Entry};
 use crate::launch::{self, Backend};
-use crate::config::{Block, Draft, OpenIn};
+use crate::config::{Block, Draft, OpenIn, SectionEntry};
 use crate::theme::Theme;
 use crate::ui::{ACCENT_PRESETS, ColorChoice, Form, KIND_ROW, PRIMARY_PRESETS, SettingRow};
 use crate::{config, platform, ssh, startup};
@@ -27,6 +27,13 @@ pub enum Mode {
     /// Choosing where to land. `force` carries a one-off destination through
     /// the picker so `w` then a folder still opens a window.
     Folders { entry: usize, sel: usize, force: Option<OpenIn> },
+    /// The selected tile is grabbed, and the arrows move it rather than the
+    /// cursor. Which tile that is stays in `sel`, as it does everywhere else --
+    /// the cursor travels with the tile, so there is nothing extra to remember.
+    Move,
+    /// The group list. `buf` holds a title being typed, for a rename or a new
+    /// group; `None` means the row keys (`a`, `d`, `J`/`K`) are live instead.
+    Sections { focus: usize, buf: Option<String> },
 }
 
 /// `~/.zshrc` rather than `/Users/albe/.zshrc`: a settings row has 56 columns.
@@ -47,14 +54,23 @@ pub struct Status {
 pub struct App {
     pub ssh_config: PathBuf,
     pub entries: Vec<Entry>,
+    /// Group titles; `Entry::section` indexes this. Always at least one, even
+    /// when it is the untitled group everything starts in.
+    pub sections: Vec<String>,
     pub filter: String,
     pub mode: Mode,
     pub sel: usize,
+    /// Which row of the grid is at the top: an index into the drawn rows, so it
+    /// counts section titles as well as rows of tiles.
     pub scroll: usize,
     pub hover: Option<usize>,
     pub status: Option<Status>,
     /// Rebuilt every frame; maps a screen region to an index in the visible list.
     pub hitboxes: Vec<(Rect, usize)>,
+    /// Also rebuilt every frame: the visible indices on each row of tiles, so
+    /// `j`/`k` follow the grid the user is looking at rather than assuming every
+    /// row is full -- a section boundary can end a row early.
+    pub tile_rows: Vec<Vec<usize>>,
     pub cols: usize,
     pub quit: bool,
     /// Set when a Local tile is chosen: exec'd after the terminal is restored,
@@ -81,6 +97,7 @@ impl App {
         let mut app = Self {
             ssh_config: ssh::default_config_path(),
             entries: Vec::new(),
+            sections: vec![String::new()],
             filter: String::new(),
             mode: Mode::Browse,
             sel: 0,
@@ -88,6 +105,7 @@ impl App {
             hover: None,
             status: None,
             hitboxes: Vec::new(),
+            tile_rows: Vec::new(),
             cols: 1,
             quit: false,
             handoff: None,
@@ -116,7 +134,9 @@ impl App {
             cfg.theme.primary.as_deref().unwrap_or(crate::theme::DEFAULT_PRIMARY),
             cfg.theme.accent.as_deref().unwrap_or(crate::theme::DEFAULT_ACCENT),
         );
-        self.entries = entry::build(&cfg, &self.ssh_config);
+        let board = entry::build(&cfg, &self.ssh_config);
+        self.entries = board.entries;
+        self.sections = board.sections;
         self.startup = startup::state();
         self.clamp_selection();
         match (err, announce) {
@@ -328,11 +348,40 @@ impl App {
             Mode::ConfirmDelete(_) => self.key_confirm(key),
             Mode::Settings { .. } => self.key_settings(key),
             Mode::Folders { .. } => self.key_folders(key),
+            Mode::Move => self.key_move(key, vis),
+            Mode::Sections { .. } => self.key_sections(key),
+        }
+    }
+
+    /// The row of tiles the cursor is on, and which column of it -- read off the
+    /// grid as it was actually drawn, so a short row at a section boundary is
+    /// short here too.
+    fn cursor_cell(&self) -> Option<(usize, usize)> {
+        self.tile_rows
+            .iter()
+            .enumerate()
+            .find_map(|(r, row)| row.iter().position(|&i| i == self.sel).map(|c| (r, c)))
+    }
+
+    /// Move the cursor a row up or down, keeping its column. Falls back to a
+    /// flat step of `cols` before the first frame has drawn anything.
+    fn move_row(&mut self, down: bool, vis: &[usize]) {
+        let Some((r, c)) = self.cursor_cell() else {
+            let cols = self.cols.max(1);
+            self.sel = if down {
+                (self.sel + cols).min(vis.len().saturating_sub(1))
+            } else {
+                self.sel.saturating_sub(cols)
+            };
+            return;
+        };
+        let next = if down { r + 1 } else { r.checked_sub(1).unwrap_or(r) };
+        if let Some(row) = self.tile_rows.get(next) {
+            self.sel = row[c.min(row.len() - 1)];
         }
     }
 
     fn key_browse(&mut self, key: KeyEvent, vis: &[usize]) {
-        let cols = self.cols.max(1);
         let last = vis.len().saturating_sub(1);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -345,6 +394,8 @@ impl App {
             KeyCode::Char('e') => self.begin_edit(vis),
             KeyCode::Char('d') => self.begin_delete(vis),
             KeyCode::Char('s') => self.mode = Mode::Settings { focus: 0, buf: String::new() },
+            KeyCode::Char('m') => self.begin_move(vis),
+            KeyCode::Char('S') => self.mode = Mode::Sections { focus: 0, buf: None },
             KeyCode::Char('x') => self.toggle_hidden(vis),
             KeyCode::Char('r') => self.reload(),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(vis),
@@ -353,8 +404,8 @@ impl App {
             KeyCode::Char('c') => self.activate_in(vis, Some(OpenIn::Current)),
             KeyCode::Left | KeyCode::Char('h') => self.sel = self.sel.saturating_sub(1),
             KeyCode::Right | KeyCode::Char('l') => self.sel = (self.sel + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => self.sel = self.sel.saturating_sub(cols),
-            KeyCode::Down | KeyCode::Char('j') => self.sel = (self.sel + cols).min(last),
+            KeyCode::Up | KeyCode::Char('k') => self.move_row(false, vis),
+            KeyCode::Down | KeyCode::Char('j') => self.move_row(true, vis),
             KeyCode::Home | KeyCode::Char('g') => self.sel = 0,
             KeyCode::End | KeyCode::Char('G') => self.sel = last,
             KeyCode::Char(c @ '1'..='9') => {
@@ -643,6 +694,238 @@ impl App {
                 }
             }
             _ => self.mode = Mode::Browse,
+        }
+    }
+
+    // ----------------------------------------------------- order and groups
+
+    /// The arrangement as it stands, complete: one entry per group, every tile
+    /// named once. Read back off the screen rather than the file, so a tile the
+    /// config never placed is already in the group it is being drawn under and
+    /// the first move writes something true rather than something partial.
+    pub fn layout(&self) -> Vec<SectionEntry> {
+        self.sections
+            .iter()
+            .enumerate()
+            .map(|(s, title)| SectionEntry {
+                title: title.clone(),
+                items: self
+                    .entries
+                    .iter()
+                    .filter(|e| e.section == s)
+                    .map(|e| e.label.clone())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Labels of the tiles currently on screen, in order. What the mover counts
+    /// in: a step onto a hidden or filtered-out tile would look like nothing.
+    fn shown_labels(&self, vis: &[usize]) -> Vec<String> {
+        vis.iter().map(|&i| self.entries[i].label.clone()).collect()
+    }
+
+    fn begin_move(&mut self, vis: &[usize]) {
+        if self.selected_entry(vis).is_none() {
+            return;
+        }
+        self.mode = Mode::Move;
+        self.say("moving — arrows place it, ⏎ done".to_string(), true);
+    }
+
+    fn key_move(&mut self, key: KeyEvent, vis: &[usize]) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('m') => {
+                self.mode = Mode::Browse;
+                self.status = None;
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.shift_tile(vis, false, 1),
+            KeyCode::Right | KeyCode::Char('l') => self.shift_tile(vis, true, 1),
+            KeyCode::Up | KeyCode::Char('k') => self.shift_tile(vis, false, self.cols.max(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.shift_tile(vis, true, self.cols.max(1)),
+            KeyCode::Home | KeyCode::Char('g') => self.shift_tile(vis, false, vis.len()),
+            KeyCode::End | KeyCode::Char('G') => self.shift_tile(vis, true, vis.len()),
+            _ => {}
+        }
+    }
+
+    /// The arrangement after moving the grabbed tile `n` places, or `None` when
+    /// it is already against the end of the screen and cannot go further.
+    ///
+    /// `n` is a row's worth for the vertical keys, so `j` lands a tile roughly
+    /// under where it was -- the same distance the cursor would have travelled.
+    pub fn shifted(&self, vis: &[usize], forward: bool, n: usize) -> Option<Vec<SectionEntry>> {
+        let ei = self.selected_entry(vis)?;
+        let label = self.entries[ei].label.clone();
+        let shown = self.shown_labels(vis);
+        let mut layout = self.layout();
+
+        let mut moved = false;
+        for _ in 0..n {
+            let from = config::shown_position(&layout, &label, &shown);
+            // Keep stepping until the tile lands somewhere the screen shows
+            // differently -- one step can pass over a tile that is hidden or
+            // filtered out, and stopping there would look like a dead key.
+            let mut stepped = false;
+            while config::step(&mut layout, &label, forward) {
+                if config::shown_position(&layout, &label, &shown) != from {
+                    stepped = true;
+                    break;
+                }
+            }
+            if !stepped {
+                break;
+            }
+            moved = true;
+        }
+        moved.then_some(layout)
+    }
+
+    fn shift_tile(&mut self, vis: &[usize], forward: bool, n: usize) {
+        let Some(layout) = self.shifted(vis, forward, n) else { return };
+        let Some(ei) = self.selected_entry(vis) else { return };
+        let label = self.entries[ei].label.clone();
+        self.write_layout(&layout, &label);
+    }
+
+    /// Write the arrangement, reload, and put the cursor back on the tile that
+    /// moved -- which is what makes a run of arrow presses feel like dragging
+    /// one tile rather than shuffling a list under a fixed cursor.
+    fn write_layout(&mut self, layout: &[SectionEntry], focus: &str) {
+        match config::write_sections(layout) {
+            Ok(()) => {
+                self.load(false);
+                self.focus_named(focus);
+            }
+            Err(e) => self.say(format!("write failed: {e}"), false),
+        }
+    }
+
+    /// Rows in the group panel: one per group, plus the row that makes a new
+    /// one. The last row is a verb, not a group, which is why it is counted
+    /// separately everywhere below.
+    pub fn section_rows(&self) -> usize {
+        self.sections.len() + 1
+    }
+
+    /// How many tiles are in a group, hidden ones included -- the panel is about
+    /// the arrangement, and a hidden tile still occupies a place in it.
+    pub fn section_count(&self, s: usize) -> usize {
+        self.entries.iter().filter(|e| e.section == s).count()
+    }
+
+    fn key_sections(&mut self, key: KeyEvent) {
+        let Mode::Sections { focus, buf } = &self.mode else { return };
+        let (focus, buf) = (*focus, buf.clone());
+        let n = self.sections.len();
+
+        // Typing a title owns every key: `d` is a letter here, not a verb.
+        if let Some(mut text) = buf {
+            match key.code {
+                KeyCode::Esc => self.mode = Mode::Sections { focus, buf: None },
+                KeyCode::Enter => self.commit_title(focus, text.trim().to_string()),
+                KeyCode::Backspace => {
+                    text.pop();
+                    self.mode = Mode::Sections { focus, buf: Some(text) };
+                }
+                KeyCode::Char(c) => {
+                    text.push(c);
+                    self.mode = Mode::Sections { focus, buf: Some(text) };
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('S') => self.mode = Mode::Browse,
+            KeyCode::Up | KeyCode::BackTab => {
+                let rows = self.section_rows();
+                self.mode = Mode::Sections { focus: (focus + rows - 1) % rows, buf: None }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                let rows = self.section_rows();
+                self.mode = Mode::Sections { focus: (focus + 1) % rows, buf: None }
+            }
+            // On the last row there is no title to load, which is exactly what
+            // makes it the row that starts an empty one.
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let seed = self.sections.get(focus).cloned().unwrap_or_default();
+                self.mode = Mode::Sections { focus, buf: Some(seed) }
+            }
+            KeyCode::Char('a') => {
+                self.mode = Mode::Sections { focus: n, buf: Some(String::new()) }
+            }
+            KeyCode::Char('d') if focus < n => self.delete_section(focus),
+            KeyCode::Char('K') if focus < n => self.swap_sections(focus, false),
+            KeyCode::Char('J') if focus < n => self.swap_sections(focus, true),
+            _ => {}
+        }
+    }
+
+    /// Save a typed title: a rename on a group row, a new group on the last one.
+    fn commit_title(&mut self, focus: usize, title: String) {
+        let mut layout = self.layout();
+        if focus < layout.len() {
+            layout[focus].title = title;
+        } else if title.is_empty() {
+            // An untitled empty group is what everything already sits in, so
+            // making a second one would add a heading you cannot see.
+            self.say("a new group needs a title".to_string(), false);
+            self.mode = Mode::Sections { focus, buf: None };
+            return;
+        } else {
+            layout.push(SectionEntry { title, items: Vec::new() });
+        }
+        self.save_sections(layout, focus);
+    }
+
+    /// Remove a group, keeping its tiles: they join the group before it, or the
+    /// one after when it was the first. Deleting a heading must never delete a
+    /// host.
+    fn delete_section(&mut self, focus: usize) {
+        let mut layout = self.layout();
+        if focus >= layout.len() {
+            return;
+        }
+        let gone = layout.remove(focus);
+        if focus > 0 {
+            layout[focus - 1].items.extend(gone.items);
+        } else if let Some(into) = layout.first_mut() {
+            let mut items = gone.items;
+            items.append(&mut into.items);
+            into.items = items;
+        } else {
+            // The last group standing: keep the tiles, drop the title.
+            layout.push(SectionEntry { title: String::new(), items: gone.items });
+        }
+        self.save_sections(layout, focus.saturating_sub(1));
+    }
+
+    fn swap_sections(&mut self, focus: usize, down: bool) {
+        let mut layout = self.layout();
+        let other = if down { focus + 1 } else { focus.wrapping_sub(1) };
+        if other >= layout.len() {
+            return;
+        }
+        layout.swap(focus, other);
+        self.save_sections(layout, other);
+    }
+
+    fn save_sections(&mut self, layout: Vec<SectionEntry>, focus: usize) {
+        match config::write_sections(&layout) {
+            Ok(()) => {
+                let name = self.selected_entry(&self.visible()).map(|i| self.entries[i].label.clone());
+                self.load(false);
+                if let Some(n) = name {
+                    self.focus_named(&n);
+                }
+                self.mode = Mode::Sections { focus: focus.min(self.sections.len()), buf: None };
+            }
+            Err(e) => {
+                self.say(format!("write failed: {e}"), false);
+                self.mode = Mode::Sections { focus, buf: None };
+            }
         }
     }
 

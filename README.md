@@ -19,8 +19,11 @@ terminal gets whitespace, not vast tiles.
    ┃    local shell                   ┃  │    v120bb18@alex.nhr.fau.de ⤳    │
    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ╰──────────────────────────────────╯
 
-   ⏎ open   t/w/c tab·win·here   / find   a add   e edit   x hide   s settings
+   ⏎ open   t/w/c tab·win·here   / find   a add   e edit   m move   S groups
 ```
+
+Tiles keep the order you put them in, and can be grouped under headings — `m`
+moves one, `S` manages the groups. See [Order and groups](#order-and-groups).
 
 Two kinds of tile:
 
@@ -135,6 +138,8 @@ rather it didn't, pin that host to another colour.
 | `/` | find by name, target, or jump host; `esc` clears |
 | `a` | add a host |
 | `e` | edit the selected host — including ones from `~/.ssh/config` |
+| `m` | grab the selected tile; the arrows then move *it*, `⏎` drops it |
+| `S` | groups — make, rename, reorder and delete the sections tiles sit in |
 | `x` | hide the selected host (or unhide it, with `show_hidden` on) |
 | `d` | delete a host, or revert an `~/.ssh/config` one (asks first) |
 | `t` / `w` / `c` | open in a new tab / new window / this terminal, once (Ghostty only; elsewhere all three mean `c`) |
@@ -194,6 +199,90 @@ resolved here at all, so the tilde is left outside the quotes for the far side
 to expand — `cd ~/'my dir'` — while the rest of the path stays one quoted word.
 Only a leading `~` or `~/…`; `~user` needs a passwd lookup, and mid-path tildes
 are literal in a shell too.
+
+## Order and groups
+
+Tiles are drawn in the order the config asks for, under whatever headings it
+gives them. `m` grabs the tile under the cursor — its border doubles and it's
+tagged `moving` — and the arrows then move the tile instead of the cursor:
+
+```
+  work  2  ────────────────────────────────────────────────
+
+  ╭ 1 ───────────────────────────────╮  ╔ 2 ═══════ moving ╗
+  │  ● mufasa                        │  ║  ● alex          ║
+  │    mufasa                        │  ║    alex          ║
+  ╰──────────────────────────────────╯  ╚══════════════════╝
+
+  personal  1  ────────────────────────────────────────────
+
+  ╭ 3 ───────────────────────────────╮
+  │  ● MACBOOK-PRO                   │
+  ╰──────────────────────────────────╯
+
+  ←→ reorder   ↑↓ by a row   g/G to an end   ⏎ drop
+```
+
+`←`/`→` move it one place, `↑`/`↓` a row's worth, `g`/`G` to one end. There is
+no separate "move to the next group" key because there doesn't need to be one:
+step off the end of a group and the tile carries into the next, which makes
+reordering within a group and moving between groups the same gesture. The cursor
+travels with the tile, so a run of arrow presses feels like dragging one rather
+than shuffling a list underneath a fixed cursor.
+
+`S` is the groups themselves — `⏎` renames, `a` makes one, `d` deletes, `J`/`K`
+reorder. Deleting a heading never deletes a host: the tiles join the group above
+it, or the one below when it was the first. A group's membership isn't edited
+here, because moving a tile into it already says everything a list of checkboxes
+would.
+
+Both write to `[[section]]` blocks:
+
+```toml
+[[section]]
+title = "work"
+items = ["alex", "csnhr"]
+
+[[section]]
+title = "personal"
+items = ["MACBOOK-PRO"]
+```
+
+Membership is by **name** — a `name` or a `label` — rather than a key on the
+tile. That is what lets a host from `~/.ssh/config` be placed and reordered
+without being given a `[[host]]` block of its own, and one list per group reads
+(and rewrites) far better than an `order` number scattered across a dozen
+blocks.
+
+Three consequences worth knowing:
+
+- **Nothing is ever stranded.** A name that no longer exists is ignored, and a
+  tile no section lists — a host that turned up in `~/.ssh/config` since you
+  wrote them — is drawn after the last group, untitled. The first move writes the
+  arrangement out in full, so it stops being implicit.
+- **An empty group is still on screen.** A group is empty the moment you make
+  one, and a group you can't see is a group you can't aim a tile at — so a named
+  one with nothing in it draws its heading and says what to do about it:
+
+  ```
+    lab  0  ─────────────────────────────────────────────────
+
+        empty — press m on a tile and move it in here
+  ```
+- **An untitled group draws no heading**, empty or not. That is the group every
+  tile is in before you make a section, which is why a config with no
+  `[[section]]` in it looks exactly as it did before they existed — and why an
+  empty untitled group is dropped from the file rather than written down.
+- **Moving a tile never repaints it.** Colours are assigned before the
+  arrangement is applied, so dragging one host across the screen can't shift the
+  palette slot of a stranger three tiles away.
+
+A heading counts the tiles you can *see*, so it agrees with what is under it
+when a host is hidden or a filter is on. The mover counts the same way: a step
+that would land on a hidden tile keeps going, since stopping there would look
+like a dead key. A filter is a temporary lens rather than a rearrangement, so
+while one is active the groups it empties drop their headings instead of standing
+over nothing.
 
 ## Editing, in the TUI
 
@@ -295,6 +384,10 @@ jump = "bastion"
 color = "#4f8ab0"
 hidden = false
 open_in = "window"          # overrides the global for this host
+
+[[section]]                 # a group, drawn in this order
+title = "work"
+items = ["myserver", "bastion"]
 ```
 
 Edits rewrite whole blocks **as text** rather than re-serialising the document,
@@ -303,6 +396,14 @@ asserts the file comes back byte-identical, and editing a host keeps it in
 position rather than moving it to the end. `a`/`e`/`d` work on `[[host]]` and
 `[[local]]` blocks alike, keyed on `name` and `label` respectively — so a host
 and a local tile may share a name without colliding.
+
+`[[section]]` is the one block rewritten wholesale, and the one the UI owns
+outright: it is a list of names in an order `m` shuffles, so there is no field to
+patch in place and nothing a comment inside it could be about. The position of
+the first block is kept, so moving a tile doesn't grow the file a new tail every
+time; a long group wraps to one name per line so it stays readable by hand; and
+`dropping_every_section_leaves_the_file_as_it_started` asserts that taking the
+last group away leaves the rest of the file byte-identical.
 
 A TOML syntax error is reported in the status line and leaves the previous
 screen usable; a typo must never cost you the home screen.

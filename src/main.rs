@@ -110,7 +110,7 @@ fn run_cli() -> io::Result<Option<i32>> {
             if let Some(e) = err {
                 eprintln!("{e}");
             }
-            for e in entry::build(&cfg, &ssh::default_config_path()) {
+            for e in entry::build(&cfg, &ssh::default_config_path()).entries {
                 let kind = if e.is_local() { "local" } else { "ssh" };
                 let mark = if e.hidden() { "hidden" } else { "" };
                 let t = e.tint();
@@ -130,7 +130,7 @@ fn run_cli() -> io::Result<Option<i32>> {
                 return Ok(Some(2));
             };
             let (cfg, _) = config::load();
-            let entries = entry::build(&cfg, &ssh::default_config_path());
+            let entries = entry::build(&cfg, &ssh::default_config_path()).entries;
             // Prefer a configured tile so its args and colour are used; fall
             // back to treating the argument as a bare ssh target.
             let found = entries.iter().find(|e| e.label == name && !e.is_local());
@@ -369,6 +369,29 @@ mod tests {
             a.filter = "c".into();
         });
         println!("=== filter ===\n{filt}");
+        let (_, grouped) = frame(120, 40, |a| {
+            a.sections = vec!["work".into(), "home".into(), "lab".into()];
+            let vis = a.visible();
+            for (n, &i) in vis.iter().enumerate() {
+                a.entries[i].section = usize::from(n > 1);
+            }
+        });
+        println!("=== sections ===\n{grouped}");
+        let (_, moving) = frame(120, 40, |a| {
+            a.sections = vec!["work".into(), "home".into()];
+            let vis = a.visible();
+            for (n, &i) in vis.iter().enumerate() {
+                a.entries[i].section = usize::from(n > 1);
+            }
+            a.sel = 1;
+            a.mode = Mode::Move;
+        });
+        println!("=== moving a tile ===\n{moving}");
+        let (_, groups) = frame(120, 40, |a| {
+            a.sections = vec!["work".into(), "home".into(), String::new()];
+            a.mode = Mode::Sections { focus: 1, buf: None };
+        });
+        println!("=== groups panel ===\n{groups}");
     }
 
     #[test]
@@ -729,6 +752,215 @@ mod tests {
             })
             .collect();
         assert!(!keys.contains(&"startup"), "it lives in the shell rc, not the config");
+    }
+
+    // ------------------------------------------------------------- sections
+
+    /// Put every visible tile after the first into a second group, so a board
+    /// with two named sections can be drawn whatever the machine's own config
+    /// happens to hold.
+    fn split_into_two_groups(a: &mut App) {
+        a.sections = vec!["alpha".into(), "beta".into()];
+        let vis = a.visible();
+        for (n, &i) in vis.iter().enumerate() {
+            a.entries[i].section = usize::from(n > 0);
+        }
+    }
+
+    /// A named group announces itself above its tiles, and the group after it
+    /// starts a fresh row rather than filling out the one before.
+    #[test]
+    fn a_named_group_gets_a_title_row_of_its_own() {
+        if App::new().visible().len() < 3 {
+            return;
+        }
+        let (app, out) = frame(120, 44, split_into_two_groups);
+
+        assert!(out.contains("alpha"), "the first group is titled");
+        assert!(out.contains("beta"));
+        assert_eq!(
+            app.tile_rows.first().map(|r| r.len()),
+            Some(1),
+            "the one tile in alpha keeps its row to itself"
+        );
+        let first = app.hitboxes[0].0.y;
+        assert!(
+            app.hitboxes[1..].iter().all(|(r, _)| r.y > first),
+            "beta's tiles are all below alpha's"
+        );
+    }
+
+    /// A group you have just made is empty by definition, so an empty one has to
+    /// be on screen: one you cannot see is one you cannot aim a tile at.
+    #[test]
+    fn an_empty_named_group_still_shows_its_heading() {
+        let (app, out) = frame(120, 44, |a| {
+            a.sections = vec![String::new(), "lab".into()];
+            for e in a.entries.iter_mut() {
+                e.section = 0;
+            }
+        });
+        assert!(out.contains("lab"), "the empty group names itself");
+        assert!(out.contains("empty — press m"), "and says how to fill it");
+        assert_eq!(app.hitboxes.len(), app.visible().len(), "without inventing a tile");
+    }
+
+    /// A filter is a temporary lens, not a rearrangement, so it does not get to
+    /// leave headings standing over nothing.
+    #[test]
+    fn a_filter_drops_the_groups_it_empties() {
+        let (_, out) = frame(120, 44, |a| {
+            a.sections = vec![String::new(), "lab".into()];
+            for e in a.entries.iter_mut() {
+                e.section = 0;
+            }
+            a.mode = Mode::Filter;
+            a.filter = "zzzz-matches-nothing".into();
+        });
+        assert!(!out.contains("lab"), "no heading over an emptied group");
+    }
+
+    /// An untitled group is what everything starts in, so it has to cost
+    /// nothing: no heading, and no row given up to one.
+    #[test]
+    fn an_untitled_group_draws_no_heading() {
+        let one_group = |title: &str| {
+            let title = title.to_string();
+            move |a: &mut App| {
+                a.sections = vec![title.clone()];
+                for e in a.entries.iter_mut() {
+                    e.section = 0;
+                }
+            }
+        };
+        let (plain, before) = frame(120, 44, one_group(""));
+        let (named, after) = frame(120, 44, one_group("work"));
+
+        // How many rows sit between the rule under the wordmark and the tiles.
+        let gap = |out: &str| {
+            let lines: Vec<&str> = out.lines().collect();
+            let tile = |l: &&&str| l.contains('┏') || l.contains('╭');
+            let rule = lines.iter().position(|l| l.contains('━') && !l.contains('┏')).unwrap();
+            lines.iter().position(|l| tile(&l)).unwrap() - rule - 1
+        };
+        assert_eq!(gap(&before), 1, "an untitled group costs no rows at all");
+        assert_eq!(gap(&after), 3, "a named one costs its heading and the blank under it");
+        assert!(!before.contains("work") && after.contains("work"));
+        assert_eq!(plain.hitboxes.len(), named.hitboxes.len(), "same tiles either way");
+    }
+
+    /// `j` follows the grid as drawn. A group that ends a row early must not
+    /// send the cursor to wherever a fixed stride of `cols` would have put it.
+    #[test]
+    fn moving_down_lands_on_the_row_below_a_short_row() {
+        let (mut app, _) = frame(120, 44, |a| {
+            a.sections = vec!["alpha".into(), "beta".into()];
+            let vis = a.visible();
+            for (n, &i) in vis.iter().enumerate() {
+                a.entries[i].section = usize::from(n > 1);
+            }
+        });
+        if app.cols != 3 || app.visible().len() < 5 {
+            return;
+        }
+        // alpha holds two tiles, so its row is one short of full.
+        assert_eq!(app.tile_rows[0].len(), 2);
+        app.sel = 0;
+        press(&mut app, ratatui::crossterm::event::KeyCode::Char('j'));
+        assert_eq!(app.sel, 2, "the row below, not three tiles along");
+    }
+
+    /// What a move writes is the arrangement read back off the screen, so it has
+    /// to account for every tile: a layout that omitted one would delete it from
+    /// the order the moment anything else moved.
+    #[test]
+    fn the_layout_read_off_the_screen_accounts_for_every_tile() {
+        let app = App::new();
+        let layout = app.layout();
+        assert_eq!(layout.len(), app.sections.len(), "one entry per group");
+        let placed: usize = layout.iter().map(|s| s.items.len()).sum();
+        assert_eq!(placed, app.entries.len(), "every tile, hidden ones included");
+        for (s, sec) in layout.iter().enumerate() {
+            assert_eq!(sec.title, app.sections[s]);
+        }
+    }
+
+    /// `m` grabs the tile under the cursor rather than opening anything, and the
+    /// footer is the only chrome that changes -- the grid is what is being
+    /// edited, so it stays lit.
+    #[test]
+    fn m_grabs_the_selected_tile() {
+        let mut app = App::new();
+        if app.visible().is_empty() {
+            return;
+        }
+        press(&mut app, ratatui::crossterm::event::KeyCode::Char('m'));
+        assert!(matches!(app.mode, Mode::Move));
+        press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Browse), "⏎ drops it");
+        assert!(app.status.is_none(), "and takes the hint away with it");
+    }
+
+    /// The arrows move the tile, not the cursor: a step yields a new arrangement
+    /// with the tile one place along, and a step off the end of a group carries
+    /// it into the next one rather than stopping at the boundary.
+    #[test]
+    fn stepping_a_grabbed_tile_rewrites_the_arrangement() {
+        let mut app = App::new();
+        if app.visible().len() < 3 {
+            return;
+        }
+        // One tile alone in the first group, everything else -- hidden tiles
+        // included, since they hold places too -- in the second.
+        app.sections = vec!["alpha".into(), "beta".into()];
+        for e in app.entries.iter_mut() {
+            e.section = 1;
+        }
+        let vis = app.visible();
+        app.entries[vis[0]].section = 0;
+        app.sel = 0;
+        let label = app.entries[vis[0]].label().to_string();
+
+        let forward = app.shifted(&vis, true, 1).expect("it can leave its group");
+        assert!(forward[0].items.is_empty(), "alpha is empty now");
+        assert_eq!(forward[1].items.first(), Some(&label), "at the head of beta");
+        assert_eq!(
+            forward.iter().map(|s| s.items.len()).sum::<usize>(),
+            app.entries.len(),
+            "and no tile was lost on the way"
+        );
+
+        // The first slot on screen has nothing before it: the ends are walls.
+        assert!(app.shifted(&vis, false, 1).is_none());
+    }
+
+    /// A title is typed before anything is written, which is what lets `d` be a
+    /// letter on that row and a verb everywhere else in the panel.
+    #[test]
+    fn the_group_panel_drafts_a_title_before_saving_it() {
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('S'));
+        assert!(matches!(app.mode, Mode::Sections { focus: 0, buf: None }));
+
+        // The last row is the one that makes a group, so it starts empty.
+        for _ in 0..app.section_rows() - 1 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.mode, Mode::Sections { buf: Some(b), .. } if b.is_empty()));
+
+        for c in ['d', 'a', 'y'] {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Backspace);
+        assert!(matches!(&app.mode, Mode::Sections { buf: Some(b), .. } if b == "da"));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Sections { buf: None, .. }), "the draft is dropped");
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.sections, App::new().sections, "nothing was written");
     }
 
     #[test]

@@ -13,6 +13,8 @@ use crate::theme::Theme;
 
 /// Cell height per tile: a 4-row box plus a 1-row gutter.
 const CELL_H: u16 = 5;
+/// A section title and the blank line under it.
+const TITLE_H: u16 = 2;
 /// Preferred cell width, gutter included. Tiles keep this size rather than
 /// stretching, so a wide terminal gets whitespace instead of vast tiles.
 const CELL_W: u16 = 38;
@@ -22,40 +24,114 @@ const MAX_COLS: usize = 4;
 const CHROME_H: u16 = 7;
 const PAD: u16 = 2;
 
+/// One drawn row of the grid.
+///
+/// Rows are a list rather than an arithmetic function of the tile count now,
+/// because a title takes a row and a section boundary can end a row of tiles
+/// early -- neither of which `count / cols` can express.
+enum GridRow {
+    /// A section's title, above the tiles it names.
+    Title(usize),
+    /// Positions in the visible list, left to right.
+    Tiles(Vec<usize>),
+    /// A named section with nothing to draw under its title.
+    Empty,
+}
+
+impl GridRow {
+    fn height(&self) -> u16 {
+        match self {
+            GridRow::Title(_) | GridRow::Empty => TITLE_H,
+            GridRow::Tiles(_) => CELL_H,
+        }
+    }
+}
+
+/// Break the visible tiles into rows, with a title above each named section.
+///
+/// Driven by the sections rather than by the tiles, because a section with
+/// nothing in it still has to appear: a group you have just made is empty by
+/// definition, and one you cannot see is one you cannot aim a tile at.
+///
+/// An untitled section never gets a row of its own -- empty it has nothing to
+/// say, and full it is the default screen, which is what keeps a config with no
+/// sections in it looking exactly as it did before they existed.
+fn grid_rows(app: &App, vis: &[usize], cols: usize) -> Vec<GridRow> {
+    let group_of = |s: usize| -> Vec<usize> {
+        (0..vis.len()).filter(|&n| app.entries[vis[n]].section == s).collect()
+    };
+
+    let mut rows = Vec::new();
+    for (s, title) in app.sections.iter().enumerate() {
+        let group = group_of(s);
+        if group.is_empty() {
+            // A filter is a temporary lens, not a rearrangement, so it does not
+            // get to leave headings behind over nothing.
+            if !title.is_empty() && app.filter.is_empty() {
+                rows.push(GridRow::Title(s));
+                rows.push(GridRow::Empty);
+            }
+            continue;
+        }
+        if !title.is_empty() {
+            rows.push(GridRow::Title(s));
+        }
+        rows.extend(group.chunks(cols).map(|c| GridRow::Tiles(c.to_vec())));
+    }
+
+    // `build` gives every tile a real section, so this is empty in practice --
+    // but a tile whose group went missing must end up on screen anyway rather
+    // than falling out of the loop above unnoticed.
+    let orphans: Vec<usize> =
+        (0..vis.len()).filter(|&n| app.entries[vis[n]].section >= app.sections.len()).collect();
+    rows.extend(orphans.chunks(cols).map(|c| GridRow::Tiles(c.to_vec())));
+    rows
+}
+
+fn columns(full: Rect, count: usize) -> usize {
+    let avail = full.width.saturating_sub(2 * PAD).max(1);
+    ((avail / CELL_W) as usize).clamp(1, MAX_COLS).min(count.max(1))
+}
+
 /// Where the centred block of content sits this frame.
 struct Placement {
     x: u16,
     y: u16,
     width: u16,
-    cols: usize,
     cell_w: u16,
-    rows_fit: usize,
+    /// Height given to the grid: as many whole rows as fit.
+    grid_h: u16,
 }
 
-fn place(full: Rect, count: usize) -> Placement {
+fn place(full: Rect, cols: usize, rows: &[GridRow]) -> Placement {
     let avail = full.width.saturating_sub(2 * PAD).max(1);
-    let cols = ((avail / CELL_W) as usize).clamp(1, MAX_COLS).min(count.max(1));
     let cell_w = (avail / cols as u16).min(CELL_W).max(1);
     // The last tile in a row has no gutter to its right.
     let width = (cols as u16 * cell_w).saturating_sub(2).max(1);
 
-    let rows_total = count.div_ceil(cols).max(1);
+    // Whole rows only, and always at least one row of tiles: a terminal too
+    // short for even one is better overflowing than blank.
     let for_grid = full.height.saturating_sub(CHROME_H);
-    let rows_fit = ((for_grid / CELL_H) as usize).max(1).min(rows_total);
+    let mut grid_h = 0;
+    let mut any_tiles = false;
+    for r in rows {
+        if any_tiles && grid_h + r.height() > for_grid {
+            break;
+        }
+        grid_h += r.height();
+        any_tiles |= matches!(r, GridRow::Tiles(_));
+    }
+    // At least one row of tiles, and never more than there is room for: a board
+    // of nothing but empty groups must not push the grid off the bottom.
+    let grid_h = grid_h.clamp(1, for_grid.max(CELL_H)).max(CELL_H.min(for_grid.max(1)));
 
     // Vertically centre the whole block; fall back to the top when it overflows.
-    let grid_h = rows_fit as u16 * CELL_H - 1;
-    let content_h = grid_h + CHROME_H;
+    // The grid's last row is a gutter, which doubles as the blank above the
+    // footer, so it is not part of the visible height.
+    let content_h = grid_h - 1 + CHROME_H;
     let y = full.y + full.height.saturating_sub(content_h) / 2;
 
-    Placement {
-        x: full.x + full.width.saturating_sub(width) / 2,
-        y,
-        width,
-        cols,
-        cell_w,
-        rows_fit,
-    }
+    Placement { x: full.x + full.width.saturating_sub(width) / 2, y, width, cell_w, grid_h }
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -63,15 +139,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let full = f.area();
     let th = app.theme.clone();
     let th = &th;
-    let p = place(full, vis.len());
-    app.cols = p.cols;
+    let cols = columns(full, vis.len());
+    app.cols = cols;
+    let rows = grid_rows(app, &vis, cols);
+    let p = place(full, cols, &rows);
 
     let row = |dy: u16, h: u16| Rect { x: p.x, y: p.y + dy, width: p.width, height: h };
 
     draw_header(f, app, row(0, 1), vis.len(), th);
     draw_rule(f, row(2, 1), th);
-    let grid = row(4, p.rows_fit as u16 * CELL_H);
-    draw_grid(f, app, grid, &vis, &p, th);
+    let grid = row(4, p.grid_h);
+    draw_grid(f, app, grid, &vis, &rows, &p, th);
     draw_footer(f, app, row(4 + grid.height, 2), th);
 
     match &app.mode {
@@ -93,6 +171,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             dim_behind(f, full, th);
             draw_settings(f, full, app, *focus, buf, th);
         }
+        Mode::Sections { focus, buf } => {
+            dim_behind(f, full, th);
+            draw_sections(f, full, app, *focus, buf.as_deref(), th);
+        }
+        // Move mode is not a modal: the grid *is* the thing being edited, so it
+        // stays lit and the grabbed tile marks itself.
         _ => {}
     }
 }
@@ -144,8 +228,17 @@ fn draw_rule(f: &mut Frame, area: Rect, th: &Theme) {
     );
 }
 
-fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, vis: &[usize], p: &Placement, th: &Theme) {
+fn draw_grid(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    vis: &[usize],
+    rows: &[GridRow],
+    p: &Placement,
+    th: &Theme,
+) {
     app.hitboxes.clear();
+    app.tile_rows.clear();
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -163,51 +256,119 @@ fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, vis: &[usize], p: &Placem
         return;
     }
 
-    let rows_total = vis.len().div_ceil(p.cols);
-    let sel_row = app.sel / p.cols;
-    if sel_row < app.scroll {
-        app.scroll = sel_row;
-    } else if sel_row >= app.scroll + p.rows_fit {
-        app.scroll = sel_row + 1 - p.rows_fit;
-    }
-    app.scroll = app.scroll.min(rows_total.saturating_sub(p.rows_fit));
+    let height_from = |start: usize| -> u16 {
+        rows[start..].iter().map(|r| r.height()).sum()
+    };
+    app.scroll = app.scroll.min(rows.len().saturating_sub(1));
 
-    for r in 0..p.rows_fit {
-        let row = app.scroll + r;
-        if row >= rows_total {
+    // Keep the selected tile in view, and its title with it -- a group you have
+    // scrolled into head-first should still say which group it is.
+    if let Some(sel_row) =
+        rows.iter().position(|r| matches!(r, GridRow::Tiles(t) if t.contains(&app.sel)))
+    {
+        let top = if sel_row > 0 && matches!(rows[sel_row - 1], GridRow::Title(_)) {
+            sel_row - 1
+        } else {
+            sel_row
+        };
+        app.scroll = app.scroll.min(top);
+        while app.scroll < sel_row
+            && rows[app.scroll..=sel_row].iter().map(|r| r.height()).sum::<u16>() > area.height
+        {
+            app.scroll += 1;
+        }
+    }
+    // Don't leave a gap at the bottom while there is still something above.
+    while app.scroll > 0 && height_from(app.scroll - 1) <= area.height {
+        app.scroll -= 1;
+    }
+
+    let mut y = area.y;
+    let mut drawn = 0;
+    for r in &rows[app.scroll..] {
+        if y + r.height() > area.y + area.height {
             break;
         }
-        for c in 0..p.cols {
-            let i = row * p.cols + c;
-            if i >= vis.len() {
-                break;
+        match r {
+            GridRow::Title(s) => draw_section_title(
+                f,
+                Rect { x: area.x, y, width: area.width, height: 1 },
+                &app.sections[*s],
+                // What is on screen, not what the group holds: a heading that
+                // counted hidden or filtered-out tiles would contradict the
+                // tiles under it.
+                vis.iter().filter(|&&i| app.entries[i].section == *s).count(),
+                th,
+            ),
+            GridRow::Tiles(items) => {
+                for (c, &i) in items.iter().enumerate() {
+                    let cell = Rect {
+                        x: area.x + c as u16 * p.cell_w,
+                        y,
+                        width: p.cell_w,
+                        height: CELL_H,
+                    };
+                    // Hit-test the whole cell, gutter included -- a near miss
+                    // should still land on the tile you aimed at.
+                    app.hitboxes.push((cell, i));
+                    draw_tile(
+                        f,
+                        &app.entries[vis[i]],
+                        cell,
+                        i,
+                        i == app.sel,
+                        app.hover == Some(i),
+                        matches!(app.mode, Mode::Move) && i == app.sel,
+                        th,
+                    );
+                }
+                app.tile_rows.push(items.clone());
             }
-            let cell = Rect {
-                x: area.x + c as u16 * p.cell_w,
-                y: area.y + r as u16 * CELL_H,
-                width: p.cell_w,
-                height: CELL_H,
-            };
-            // Hit-test the whole cell, gutter included -- a near miss should
-            // still land on the tile you aimed at.
-            app.hitboxes.push((cell, i));
-            draw_tile(f, &app.entries[vis[i]], cell, i, i == app.sel, app.hover == Some(i), th);
+            // Says what to do about it, right where the tiles would be: this is
+            // the one place a group's own emptiness is visible, and the gesture
+            // that fills it is not one you would guess.
+            GridRow::Empty => f.render_widget(
+                Paragraph::new(Line::styled(
+                    "    empty — press m on a tile and move it in here",
+                    Style::default().fg(th.faint),
+                )),
+                Rect { x: area.x, y, width: area.width, height: 1 },
+            ),
         }
+        y += r.height();
+        drawn += 1;
     }
 
-    if rows_total > p.rows_fit {
+    if drawn < rows.len() {
         let x = area.x + area.width + 1;
         if x < f.area().width {
             draw_scrollbar(
                 f,
                 Rect { x, y: area.y, width: 1, height: area.height.saturating_sub(1) },
                 app.scroll,
-                p.rows_fit,
-                rows_total,
+                drawn,
+                rows.len(),
                 th,
             );
         }
     }
+}
+
+/// A group's title, then a hairline out to the edge -- the same shape as the
+/// rule under the wordmark, one level quieter, so the page reads as a hierarchy
+/// rather than as two competing headers.
+fn draw_section_title(f: &mut Frame, area: Rect, title: &str, count: usize, th: &Theme) {
+    let name = fit(title, area.width.saturating_sub(10) as usize);
+    let tally = format!("  {count}  ");
+    let rest = (area.width as usize).saturating_sub(width_of(&name) + width_of(&tally));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(name, Style::default().fg(th.bright).add_modifier(Modifier::BOLD)),
+            Span::styled(tally, Style::default().fg(th.muted)),
+            Span::styled("─".repeat(rest), Style::default().fg(th.faint)),
+        ])),
+        area,
+    );
 }
 
 fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, fit: usize, total: usize, th: &Theme) {
@@ -227,7 +388,17 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: usize, fit: usize, total: u
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_tile(f: &mut Frame, entry: &Entry, cell: Rect, idx: usize, sel: bool, hover: bool, th: &Theme) {
+#[allow(clippy::too_many_arguments)]
+fn draw_tile(
+    f: &mut Frame,
+    entry: &Entry,
+    cell: Rect,
+    idx: usize,
+    sel: bool,
+    hover: bool,
+    moving: bool,
+    th: &Theme,
+) {
     // Shrink out of the cell to leave a gutter between tiles.
     let area = Rect {
         width: cell.width.saturating_sub(2).max(1),
@@ -235,12 +406,14 @@ fn draw_tile(f: &mut Frame, entry: &Entry, cell: Rect, idx: usize, sel: bool, ho
         ..cell
     };
 
-    // Three states, three weights: selection gets thick red, hover lifts the
-    // border to primary, idle stays a hairline.
-    let (border_style, border_color, mut label_color) = match (sel, hover) {
-        (true, _) => (BorderType::Thick, th.accent, th.bright),
-        (false, true) => (BorderType::Rounded, th.primary, th.bright),
-        (false, false) => (BorderType::Rounded, th.faint, th.primary),
+    // Four states, four weights: a grabbed tile doubles its border so it reads
+    // as lifted off the grid, selection gets thick red, hover lifts the border
+    // to primary, idle stays a hairline.
+    let (border_style, border_color, mut label_color) = match (moving, sel, hover) {
+        (true, _, _) => (BorderType::Double, th.accent, th.bright),
+        (false, true, _) => (BorderType::Thick, th.accent, th.bright),
+        (false, false, true) => (BorderType::Rounded, th.primary, th.bright),
+        (false, false, false) => (BorderType::Rounded, th.faint, th.primary),
     };
     if entry.hidden() && !sel {
         label_color = th.muted;
@@ -262,7 +435,10 @@ fn draw_tile(f: &mut Frame, entry: &Entry, cell: Rect, idx: usize, sel: bool, ho
             .left_aligned(),
         );
     }
-    if entry.is_local() {
+    if moving {
+        block = block
+            .title_top(Line::styled(" moving ", Style::default().fg(th.accent)).right_aligned());
+    } else if entry.is_local() {
         block = block
             .title_top(Line::styled(" local ", Style::default().fg(th.accent_dim)).right_aligned());
     } else if entry.hidden() {
@@ -347,12 +523,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
                 ("/", "find"),
                 ("a", "add"),
                 ("e", "edit"),
+                ("m", "move"),
+                ("S", "groups"),
                 ("x", "hide"),
                 ("s", "settings"),
                 ("q", "shell"),
             ]);
             key_hints(th, &hints)
         }
+        // The one mode with no modal in front of it, so the footer is the only
+        // place that can say the arrows have stopped moving the cursor.
+        Mode::Move => key_hints(
+            th,
+            &[("←→", "reorder"), ("↑↓", "by a row"), ("g/G", "to an end"), ("⏎", "drop")],
+        ),
         _ => Line::raw(""),
     };
 
@@ -923,6 +1107,86 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, focus: usize, buf: &str, 
     lines.push(Line::from(vec![
         Span::raw("   "),
         Span::styled("↑↓ move   space/←/→ change   esc close", Style::default().fg(th.faint)),
+    ]));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The group list: what sections exist, in the order they are drawn, and the
+/// verbs that change that.
+///
+/// Membership is not edited here -- a tile is put in a group by being moved into
+/// it, which is the same gesture as reordering and needs no list of checkboxes.
+/// This panel is only about the groups themselves.
+fn draw_sections(f: &mut Frame, area: Rect, app: &App, focus: usize, buf: Option<&str>, th: &Theme) {
+    let rows = app.section_rows();
+    let area = modal_area(f, area, 62, rows as u16 + 5);
+    let block = modal_block("groups", th);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![Line::raw("")];
+    for i in 0..rows {
+        let on = i == focus;
+        let typing = on.then_some(buf).flatten();
+        let mut spans =
+            vec![Span::styled(if on { " ▌ " } else { "   " }, Style::default().fg(th.accent))];
+
+        match app.sections.get(i) {
+            Some(title) => {
+                let (text, style) = match (typing, title.is_empty()) {
+                    (Some(t), _) => (t.to_string(), Style::default().fg(th.bright)),
+                    // Every tile starts in an untitled group; it is a real group
+                    // that simply draws no heading, so it is named as one here
+                    // rather than left as a blank row.
+                    (None, true) => ("untitled".to_string(), Style::default().fg(th.faint)),
+                    (None, false) => (
+                        title.clone(),
+                        Style::default().fg(if on { th.bright } else { th.primary }),
+                    ),
+                };
+                match typing {
+                    // The caret has to sit against the name, so a row being
+                    // typed into is not padded out to the tally column.
+                    Some(_) => {
+                        spans.push(Span::styled(text, style));
+                        spans.push(Span::styled("▌", Style::default().fg(th.accent)));
+                    }
+                    None => {
+                        let n = app.section_count(i);
+                        spans.push(Span::styled(format!("{:<28}", fit(&text, 27)), style));
+                        spans.push(Span::styled(
+                            format!("{n} tile{}", if n == 1 { "" } else { "s" }),
+                            Style::default().fg(th.muted),
+                        ));
+                    }
+                }
+            }
+            None => match typing {
+                Some(t) => {
+                    spans.push(Span::styled(t.to_string(), Style::default().fg(th.bright)));
+                    spans.push(Span::styled("▌", Style::default().fg(th.accent)));
+                }
+                None => spans.push(Span::styled(
+                    "+ new group",
+                    Style::default().fg(if on { th.bright } else { th.muted }),
+                )),
+            },
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("   "),
+        Span::styled(
+            if buf.is_some() {
+                "⏎ save   esc cancel"
+            } else {
+                "↑↓ move  ⏎ rename  a new  d delete  J/K order  esc close"
+            },
+            Style::default().fg(th.faint),
+        ),
     ]));
 
     f.render_widget(Paragraph::new(lines), inner);

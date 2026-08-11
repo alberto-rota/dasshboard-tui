@@ -4,7 +4,7 @@ use std::path::Path;
 
 use ratatui::style::Color;
 
-use crate::config::{Config, HostEntry, OpenIn};
+use crate::config::{self, Config, HostEntry, OpenIn};
 use crate::ssh;
 
 /// A host's identity colour, and the emoji that stands in for it where only
@@ -183,6 +183,21 @@ pub struct Entry {
     /// into a picker.
     pub folders: Vec<String>,
     pub defaults: Defaults,
+    /// Which group this tile is drawn under: an index into `Board::sections`.
+    /// Entries are stored in drawing order, so a section is always one
+    /// contiguous run of them.
+    pub section: usize,
+}
+
+/// The home screen: every tile in the order it is drawn, and the title of each
+/// group they fall into.
+///
+/// The two travel together because neither is meaningful alone -- a section
+/// index means nothing without the titles, and the titles mean nothing without
+/// tiles ordered to match.
+pub struct Board {
+    pub entries: Vec<Entry>,
+    pub sections: Vec<String>,
 }
 
 impl Entry {
@@ -393,6 +408,7 @@ fn from_ssh_config(h: ssh::Host, ov: Option<&HostEntry>) -> Entry {
         jump,
         argv,
         defaults,
+        section: 0,
     }
 }
 
@@ -430,11 +446,13 @@ fn from_config(e: &HostEntry) -> Entry {
         open_in: e.open_in,
         folders: e.folders.clone(),
         defaults: Defaults::default(),
+        section: 0,
     }
 }
 
-/// Local tiles first, then ssh hosts: the config's own, then yours.
-pub fn build(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
+/// Local tiles first, then ssh hosts: the config's own, then yours -- the order
+/// tiles are in before any `[[section]]` block has a say.
+fn collect(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
     let mut entries: Vec<Entry> = cfg
         .locals
         .iter()
@@ -450,6 +468,7 @@ pub fn build(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
             open_in: l.open_in,
             folders: l.folders.clone(),
             defaults: Defaults::default(),
+            section: 0,
         })
         .collect();
 
@@ -483,6 +502,42 @@ pub fn build(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
         e.tint = tint;
     }
     entries
+}
+
+/// Every tile, in the order and the groups the config asks for.
+///
+/// Colours are decided by `collect`, *before* the arrangement is applied, and
+/// that ordering is deliberate: moving a tile is then a move and nothing else.
+/// Assign after, and dragging one host across the screen would repaint a
+/// stranger three tiles away.
+pub fn build(cfg: &Config, ssh_config: &Path) -> Board {
+    let mut pool = collect(cfg, ssh_config);
+    let labels: Vec<String> = pool.iter().map(|e| e.label.clone()).collect();
+
+    let mut entries: Vec<Entry> = Vec::with_capacity(pool.len());
+    let mut sections: Vec<String> = Vec::new();
+    for (s, sec) in config::layout(&cfg.sections, &labels).iter().enumerate() {
+        sections.push(sec.title.clone());
+        for name in &sec.items {
+            if let Some(i) = pool.iter().position(|e| e.label == *name) {
+                let mut e = pool.remove(i);
+                e.section = s;
+                entries.push(e);
+            }
+        }
+    }
+    if sections.is_empty() {
+        sections.push(String::new());
+    }
+    // A host and a local tile may share a name, and a layout lists that name
+    // once, so the second of the pair can be left holding nothing. It joins the
+    // last group rather than dropping off the screen.
+    let last = sections.len() - 1;
+    for mut e in pool {
+        e.section = last;
+        entries.push(e);
+    }
+    Board { entries, sections }
 }
 
 #[cfg(test)]
@@ -691,12 +746,75 @@ mod tests {
         cfg.hosts.push(override_for("alex", Some("#9a68b0"), None));
         cfg.hosts.push(override_for("brand-new", None, None));
 
-        let entries = build(&cfg, &sshcfg);
+        let entries = build(&cfg, &sshcfg).entries;
         let names: Vec<&str> = entries.iter().map(|e| e.label()).collect();
         assert_eq!(names, ["alex", "brand-new"], "one tile per name");
         assert_eq!(entries[0].tint().hex, "#9a68b0");
         assert_eq!(entries[0].origin(), Some(Origin::SshOverridden));
         assert_eq!(entries[1].origin(), Some(Origin::Custom));
+    }
+
+    // ------------------------------------------------------------- sections
+
+    fn board_of(hosts: &[&str], sections: Vec<crate::config::SectionEntry>) -> Board {
+        let mut cfg = Config::default();
+        cfg.options.include_ssh_config = false;
+        cfg.sections = sections;
+        for h in hosts {
+            cfg.hosts.push(override_for(h, None, None));
+        }
+        build(&cfg, Path::new("/nonexistent"))
+    }
+
+    fn sec(title: &str, items: &[&str]) -> crate::config::SectionEntry {
+        crate::config::SectionEntry {
+            title: title.into(),
+            items: items.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// With nothing configured the screen is one untitled group in build order,
+    /// which is what it was before sections existed.
+    #[test]
+    fn a_board_with_no_sections_is_one_untitled_group() {
+        let b = board_of(&["a", "b"], Vec::new());
+        assert_eq!(b.sections, [""]);
+        assert_eq!(b.entries.iter().map(|e| e.label()).collect::<Vec<_>>(), ["a", "b"]);
+        assert!(b.entries.iter().all(|e| e.section == 0));
+    }
+
+    /// The `[[section]]` blocks, not the build order, decide what is drawn where
+    /// -- and each group is one contiguous run, which is what lets the grid draw
+    /// a title above it.
+    #[test]
+    fn sections_reorder_the_board_and_stay_contiguous() {
+        let b = board_of(&["a", "b", "c"], vec![sec("last", &["c"]), sec("first", &["b", "a"])]);
+        assert_eq!(b.sections, ["last", "first"]);
+        assert_eq!(b.entries.iter().map(|e| e.label()).collect::<Vec<_>>(), ["c", "b", "a"]);
+        assert_eq!(b.entries.iter().map(|e| e.section).collect::<Vec<_>>(), [0, 1, 1]);
+    }
+
+    /// A host nobody has placed yet -- one that turned up in ~/.ssh/config since
+    /// the sections were written -- must still be on screen.
+    #[test]
+    fn an_unplaced_tile_lands_after_the_last_group() {
+        let b = board_of(&["a", "b"], vec![sec("work", &["b"])]);
+        assert_eq!(b.sections, ["work", ""]);
+        assert_eq!(b.entries.iter().map(|e| e.label()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(b.entries[1].section, 1);
+    }
+
+    /// Moving a tile is a move and nothing else: colours are assigned before the
+    /// arrangement, so rearranging the screen never repaints it.
+    #[test]
+    fn rearranging_does_not_change_any_colour() {
+        let plain = board_of(&["one", "two", "three"], Vec::new());
+        let moved =
+            board_of(&["one", "two", "three"], vec![sec("x", &["three", "one"]), sec("y", &["two"])]);
+        for e in &plain.entries {
+            let same = moved.entries.iter().find(|m| m.label() == e.label()).unwrap();
+            assert_eq!(same.tint().hex, e.tint().hex, "{} was repainted", e.label());
+        }
     }
 
     /// The remote directory can't be a local `cd`, so it becomes a remote
@@ -742,7 +860,7 @@ mod tests {
             open_in: None,
             folders: vec!["~/code/app".into()],
         });
-        let entries = build(&cfg, Path::new("/nonexistent"));
+        let entries = build(&cfg, Path::new("/nonexistent")).entries;
         let t = &entries[0];
         assert_eq!(t.folders, ["~/code/app"], "the config keeps the ~, for display");
         assert_eq!(t.argv_in(Some("~/code/app")), ["/bin/zsh"], "argv unchanged");

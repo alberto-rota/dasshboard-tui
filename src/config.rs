@@ -58,6 +58,10 @@ pub struct Config {
     /// `[[local]]` blocks -- commands that take over the current tab.
     #[serde(default, rename = "local")]
     pub locals: Vec<LocalEntry>,
+    /// `[[section]]` blocks -- the order tiles are drawn in, and the groups
+    /// they are drawn under.
+    #[serde(default, rename = "section")]
+    pub sections: Vec<SectionEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +230,114 @@ pub struct LocalEntry {
     pub folders: Vec<String>,
 }
 
+/// A `[[section]]` block: a titled group of tiles, in the order they appear on
+/// screen.
+///
+/// Membership is by name rather than a key on the tile itself, for two reasons.
+/// A host from `~/.ssh/config` can then be placed and reordered without being
+/// given a `[[host]]` block of its own -- the same reason hiding one is allowed
+/// to create a block, except here no block is needed at all. And one list per
+/// group reads, and rewrites, far better than an `order` number scattered
+/// across a dozen blocks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SectionEntry {
+    /// Drawn above the group. Empty means an untitled group -- which is what
+    /// every tile is in before anyone makes a section, so the screen looks the
+    /// same until one exists.
+    #[serde(default)]
+    pub title: String,
+    /// The `name`s and `label`s in this group, in order.
+    #[serde(default)]
+    pub items: Vec<String>,
+}
+
+/// Spread `labels` over the configured sections, so that what comes back is a
+/// complete arrangement rather than a partial one: every label appears exactly
+/// once, a name no longer on screen is dropped, and anything unplaced -- a host
+/// that turned up in `~/.ssh/config` since the sections were written -- lands
+/// in a trailing untitled group.
+///
+/// This is the shape the UI moves tiles around in and writes back, which is why
+/// it has to be total: a layout that omitted a tile would lose it the moment
+/// anything else moved.
+pub fn layout(sections: &[SectionEntry], labels: &[String]) -> Vec<SectionEntry> {
+    let mut placed: Vec<&String> = Vec::new();
+    let mut out: Vec<SectionEntry> = Vec::new();
+    for s in sections {
+        let mut items = Vec::new();
+        for name in &s.items {
+            if labels.contains(name) && !placed.contains(&name) {
+                placed.push(name);
+                items.push(name.clone());
+            }
+        }
+        out.push(SectionEntry { title: s.title.clone(), items });
+    }
+
+    let rest: Vec<String> =
+        labels.iter().filter(|l| !placed.contains(l)).cloned().collect();
+    if !rest.is_empty() {
+        // Appended to the last group when it is already untitled, rather than
+        // opening a second anonymous one next to it -- they would draw as one
+        // run of tiles anyway, and two is a distinction with no picture.
+        match out.last_mut().filter(|s| s.title.is_empty()) {
+            Some(s) => s.items.extend(rest),
+            None => out.push(SectionEntry { title: String::new(), items: rest }),
+        }
+    }
+    out
+}
+
+/// Which section a tile is in, and where in it.
+fn locate(layout: &[SectionEntry], label: &str) -> Option<(usize, usize)> {
+    layout
+        .iter()
+        .enumerate()
+        .find_map(|(s, sec)| sec.items.iter().position(|i| i == label).map(|i| (s, i)))
+}
+
+/// Move a tile one place earlier or later, crossing into the neighbouring
+/// section when it runs off the end of its own -- so stepping is the only
+/// operation needed to both reorder within a group and move between groups.
+/// False when there is nowhere left to go.
+pub fn step(layout: &mut [SectionEntry], label: &str, forward: bool) -> bool {
+    let Some((s, i)) = locate(layout, label) else { return false };
+    if forward {
+        if i + 1 < layout[s].items.len() {
+            layout[s].items.swap(i, i + 1);
+        } else if s + 1 < layout.len() {
+            let it = layout[s].items.remove(i);
+            layout[s + 1].items.insert(0, it);
+        } else {
+            return false;
+        }
+    } else if i > 0 {
+        layout[s].items.swap(i - 1, i);
+    } else if s > 0 {
+        let it = layout[s].items.remove(i);
+        layout[s - 1].items.push(it);
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Where a tile sits as far as the screen is concerned: its group, and its
+/// position among the tiles of that group you can actually see.
+///
+/// Stepping is defined over the whole layout, hidden tiles included, but a step
+/// onto a hidden neighbour looks like nothing happened -- so the mover repeats
+/// until *this* changes.
+pub fn shown_position(
+    layout: &[SectionEntry],
+    label: &str,
+    shown: &[String],
+) -> Option<(usize, usize)> {
+    let (s, i) = locate(layout, label)?;
+    Some((s, layout[s].items[..i].iter().filter(|n| shown.contains(n)).count()))
+}
+
 pub fn dir() -> PathBuf {
     config_base().join("dasshboard")
 }
@@ -368,6 +480,16 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          # color = \"#4f8ab0\"\n\
          # hidden = false\n\
          # open_in = \"window\"\n\
+         \n\
+         # Groups, in the order they are drawn. `m` grabs the selected tile and\n\
+         # the arrows move it; `S` makes, renames and reorders the groups\n\
+         # themselves. Names are `name`s and `label`s, so a host from\n\
+         # ~/.ssh/config can be placed without a block of its own. Anything not\n\
+         # listed is drawn, untitled, after the last group.\n\
+         #\n\
+         # [[section]]\n\
+         # title = \"work\"\n\
+         # items = [\"myserver\", \"bastion\"]\n\
          \n\
          # Your two colours; everything else on screen is derived from them.\n\
          [theme]\n\
@@ -528,6 +650,99 @@ fn remove_block_at(path: &Path, block: Block, name: &str) -> std::io::Result<boo
     joined.push('\n');
     fs::write(path, joined)?;
     Ok(true)
+}
+
+/// Replace every `[[section]]` block with these, keeping the position of the
+/// first one.
+///
+/// The one place a block is rewritten wholesale rather than patched. A section
+/// is a list of names in an order the UI shuffles, so there is no field to edit
+/// in place and nothing a comment inside it could be about; keeping the position
+/// is what stops the file growing a new tail every time a tile moves.
+pub fn write_sections(sections: &[SectionEntry]) -> std::io::Result<()> {
+    write_sections_at(&path(), sections)
+}
+
+fn write_sections_at(path: &Path, sections: &[SectionEntry]) -> std::io::Result<()> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+
+    // An untitled empty group says nothing -- it is what the layout gives you
+    // before anyone makes a section, and writing it down would only be noise.
+    let keep: Vec<&SectionEntry> = sections
+        .iter()
+        .filter(|s| !s.title.trim().is_empty() || !s.items.is_empty())
+        .collect();
+    let rendered = render_sections(&keep);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut written = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[[section]]" {
+            let mut end = i + 1;
+            while end < lines.len() && !is_header(lines[end]) {
+                end += 1;
+            }
+            if !written {
+                out.extend(rendered.iter().cloned());
+                // Whatever follows is another table, so it needs the blank line
+                // the removed blocks were separated by.
+                if end < lines.len() && !rendered.is_empty() {
+                    out.push(String::new());
+                }
+                written = true;
+            }
+            i = end;
+            continue;
+        }
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+
+    if !written && !rendered.is_empty() {
+        if !out.last().is_some_and(|l| l.trim().is_empty()) {
+            out.push(String::new());
+        }
+        out.extend(rendered);
+    }
+    // Dropping the last section must not leave the gap it sat in behind, or
+    // repeated edits accumulate blank lines.
+    while out.len() > 1 && out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    write_lines(path, out)
+}
+
+/// Blank lines go *between* sections, so the caller decides whether the run
+/// needs one after it -- appending at the end of a file does not.
+fn render_sections(sections: &[&SectionEntry]) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in sections {
+        if !out.is_empty() {
+            out.push(String::new());
+        }
+        out.push("[[section]]".to_string());
+        if !s.title.trim().is_empty() {
+            out.push(format!("title = {:?}", s.title.trim()));
+        }
+        out.extend(items_lines(&s.items));
+    }
+    out
+}
+
+/// `items = [...]` on one line while it fits, one name per line when it does
+/// not: a group of a dozen tiles is still meant to be readable by hand.
+fn items_lines(items: &[String]) -> Vec<String> {
+    let quoted: Vec<String> = items.iter().map(|i| format!("{i:?}")).collect();
+    let one = format!("items = [{}]", quoted.join(", "));
+    if one.len() <= 76 {
+        return vec![one];
+    }
+    let mut out = vec!["items = [".to_string()];
+    out.extend(quoted.iter().map(|q| format!("    {q},")));
+    out.push("]".to_string());
+    out
 }
 
 pub fn set_option(key: &str, value: bool) -> std::io::Result<()> {
@@ -837,6 +1052,178 @@ mod tests {
         let cfg = parse(&p);
         assert!(cfg.hosts.iter().any(|h| h.name == "twin"), "the host survives");
         assert!(!cfg.locals.iter().any(|l| l.label == "twin"), "the local is gone");
+    }
+
+    // ------------------------------------------------------------- sections
+
+    fn section(title: &str, items: &[&str]) -> SectionEntry {
+        SectionEntry {
+            title: title.into(),
+            items: items.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn names(labels: &[&str]) -> Vec<String> {
+        labels.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The whole point of `layout`: whatever the file says, what comes back
+    /// accounts for every tile on screen exactly once.
+    #[test]
+    fn a_layout_covers_every_tile_and_only_real_ones() {
+        let cfg = vec![section("work", &["b", "gone", "a"]), section("home", &["c"])];
+        let out = layout(&cfg, &names(&["a", "b", "c", "d"]));
+
+        assert_eq!(out[0].title, "work");
+        assert_eq!(out[0].items, ["b", "a"], "file order wins; a stale name is dropped");
+        assert_eq!(out[1].items, ["c"]);
+        // `d` was never placed, so it lands in a trailing untitled group rather
+        // than being guessed into one of the named ones.
+        assert_eq!(out[2].title, "");
+        assert_eq!(out[2].items, ["d"]);
+    }
+
+    #[test]
+    fn no_sections_means_one_untitled_group_in_build_order() {
+        let out = layout(&[], &names(&["a", "b"]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "");
+        assert_eq!(out[0].items, ["a", "b"]);
+    }
+
+    /// A name listed twice must not draw twice, and leftovers join an untitled
+    /// last group instead of opening a second anonymous one beside it.
+    #[test]
+    fn duplicates_and_leftovers_do_not_multiply_groups() {
+        let cfg = vec![section("work", &["a", "a"]), section("", &["b"])];
+        let out = layout(&cfg, &names(&["a", "b", "c"]));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].items, ["a"]);
+        assert_eq!(out[1].items, ["b", "c"]);
+    }
+
+    #[test]
+    fn stepping_reorders_within_a_group_then_crosses_into_the_next() {
+        let mut l = vec![section("work", &["a", "b"]), section("home", &["c"])];
+
+        assert!(step(&mut l, "a", true));
+        assert_eq!(l[0].items, ["b", "a"], "swaps with its neighbour");
+
+        // Off the end of its own group and into the head of the next one.
+        assert!(step(&mut l, "a", true));
+        assert_eq!(l[0].items, ["b"]);
+        assert_eq!(l[1].items, ["a", "c"]);
+
+        // And back, to the *end* of the group it came from.
+        assert!(step(&mut l, "a", false));
+        assert_eq!(l[0].items, ["b", "a"]);
+        assert_eq!(l[1].items, ["c"]);
+
+        // The two ends of the screen are walls, not wraps.
+        assert!(!step(&mut l, "b", false));
+        assert!(!step(&mut l, "c", true));
+        assert!(!step(&mut l, "nobody", true));
+    }
+
+    /// An empty group is a real destination -- it is what you get right after
+    /// making one, and a tile has to be able to step into it.
+    #[test]
+    fn a_tile_can_step_into_an_empty_group() {
+        let mut l = vec![section("work", &["a"]), section("home", &[])];
+        assert!(step(&mut l, "a", true));
+        assert_eq!(l[0].items, Vec::<String>::new());
+        assert_eq!(l[1].items, ["a"]);
+    }
+
+    /// The mover counts in visible tiles, since a step onto a hidden one would
+    /// look on screen like nothing at all had happened.
+    #[test]
+    fn shown_position_skips_what_is_not_on_screen() {
+        let l = vec![section("work", &["a", "secret", "b"])];
+        let shown = names(&["a", "b"]);
+        assert_eq!(shown_position(&l, "a", &shown), Some((0, 0)));
+        assert_eq!(shown_position(&l, "secret", &shown), Some((0, 1)));
+        assert_eq!(shown_position(&l, "b", &shown), Some((0, 1)), "same slot as hidden");
+        assert_eq!(shown_position(&l, "nobody", &shown), None);
+    }
+
+    #[test]
+    fn sections_are_written_and_read_back() {
+        let p = scratch("sections", SEED);
+        write_sections_at(&p, &[section("work", &["a", "b"]), section("", &["c"])]).unwrap();
+
+        let cfg = parse(&p);
+        assert_eq!(cfg.sections.len(), 2);
+        assert_eq!(cfg.sections[0].title, "work");
+        assert_eq!(cfg.sections[0].items, ["a", "b"]);
+        assert_eq!(cfg.sections[1].title, "", "an untitled group needs no title key");
+        assert_eq!(cfg.sections[1].items, ["c"]);
+        // The rest of the file is still there.
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# a comment someone wrote"));
+        assert!(text.contains("[[local]]"));
+    }
+
+    /// Moving a tile rewrites the blocks; doing it repeatedly must not grow the
+    /// file or walk the sections toward the end of it.
+    #[test]
+    fn rewriting_sections_replaces_them_in_place() {
+        let p = scratch("sections-place", SEED);
+        write_sections_at(&p, &[section("work", &["a"])]).unwrap();
+        // Something after the blocks, so "in place" means anything at all.
+        write_lines(&p, {
+            let mut l: Vec<String> =
+                fs::read_to_string(&p).unwrap().lines().map(String::from).collect();
+            l.push(String::new());
+            l.push("[theme]".into());
+            l.push("primary = \"#aaaaaa\"".into());
+            l
+        })
+        .unwrap();
+        let before = fs::read_to_string(&p).unwrap();
+
+        for _ in 0..3 {
+            write_sections_at(&p, &[section("work", &["a"])]).unwrap();
+        }
+        assert_eq!(fs::read_to_string(&p).unwrap(), before, "idempotent, byte for byte");
+
+        // And the theme table is still after them, not orphaned above.
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.find("[[section]]").unwrap() < text.find("[theme]").unwrap());
+        assert_eq!(parse(&p).theme.primary.as_deref(), Some("#aaaaaa"));
+    }
+
+    /// Sections are the one thing the UI owns outright, so removing the last
+    /// one has to take the whole block with it -- and leave the file it was
+    /// added to exactly as it was.
+    #[test]
+    fn dropping_every_section_leaves_the_file_as_it_started() {
+        let p = scratch("sections-gone", SEED);
+        write_sections_at(&p, &[section("work", &["a"])]).unwrap();
+        assert!(fs::read_to_string(&p).unwrap().contains("[[section]]"));
+
+        write_sections_at(&p, &[]).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), SEED, "back to byte-identical");
+
+        // An untitled group with nothing in it is what the layout hands back
+        // before anyone makes a section; writing it down would be noise.
+        write_sections_at(&p, &[section("", &[])]).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), SEED);
+    }
+
+    /// A long group has to stay readable by hand, which one 400-column line is
+    /// not -- and it still has to parse.
+    #[test]
+    fn a_long_group_wraps_one_name_per_line() {
+        let p = scratch("sections-long", SEED);
+        let many: Vec<String> = (0..12).map(|i| format!("host-number-{i}")).collect();
+        write_sections_at(&p, &[SectionEntry { title: "lots".into(), items: many.clone() }])
+            .unwrap();
+
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("items = [\n"), "wrapped, not one long line");
+        assert!(text.lines().all(|l| l.len() < 80));
+        assert_eq!(parse(&p).sections[0].items, many);
     }
 
     #[test]

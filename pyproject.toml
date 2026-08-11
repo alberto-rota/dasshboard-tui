@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "dasshboard"
-version = "0.2.0"
+version = "0.2.1"
 description = "A home screen for your terminal: clickable SSH hosts, in colour-coded Ghostty tabs on macOS and in the current terminal everywhere else"
 readme = "README.md"
 requires-python = ">=3.8"
