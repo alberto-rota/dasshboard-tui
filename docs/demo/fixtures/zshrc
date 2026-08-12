@@ -1,0 +1,5 @@
+# The demo machine's rc: a short prompt, and nothing that would print on start.
+PROMPT='%F{008}%1~%f %F{009}❯%f '
+RPROMPT=''
+setopt no_beep
+unsetopt prompt_sp 2>/dev/null

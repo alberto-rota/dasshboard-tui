@@ -5,7 +5,7 @@ use std::path::Path;
 use ratatui::style::Color;
 
 use crate::config::{self, Config, HostEntry, OpenIn};
-use crate::ssh;
+use crate::{platform, ssh};
 
 /// A host's identity colour, and the emoji that stands in for it where only
 /// text can go -- which is where the Ghostty tab title lives.
@@ -171,17 +171,41 @@ pub struct Entry {
     pub label: String,
     pub detail: String,
     pub jump: Option<String>,
-    /// The whole command, already split -- never re-parsed by a shell.
+    /// The whole command, already split -- never re-parsed by a shell. Complete:
+    /// the folder and the command are decided when the tile is built, not when
+    /// it is pressed, because a tile is one place and one thing to run.
     pub argv: Vec<String>,
     pub kind: Kind,
     pub origin: Option<Origin>,
     pub tint: Tint,
+    /// Off the screen until `X` asks for it. A real tile in every other way:
+    /// it holds its place in its group and comes back with one keystroke,
+    /// which is the whole of the difference between hiding and deleting.
     pub hidden: bool,
     /// `None` defers to `[options] open_in`.
     pub open_in: Option<OpenIn>,
-    /// Directories this tile can start in. More than zero turns activating it
-    /// into a picker.
-    pub folders: Vec<String>,
+    /// The directory this tile starts in, as it was configured -- `~` and all,
+    /// so the screen shows what the file says. `None` means the default: home.
+    pub folder: Option<String>,
+    /// What runs there, as configured. `None` means a login shell.
+    pub command: Option<String>,
+    /// A local tile's folder is a real `chdir` rather than part of `argv`, so it
+    /// travels separately -- already resolved, since neither a `chdir` nor a
+    /// quoted `cd` expands a `~`.
+    pub cwd: Option<String>,
+    /// Whether a shell takes the surface over when `argv` ends.
+    ///
+    /// A configured command is not always something you sit in: `echo hi` prints
+    /// a line and exits, and a session that *was* that command dies with it --
+    /// leaving a tab you cannot type in, or a home screen that blinked and came
+    /// back. So a local tile with a command of its own runs it and then hands
+    /// what is left to a shell in the same folder.
+    ///
+    /// Only local tiles set it. An ssh session carries the same idea inside its
+    /// remote command, where the shell that has to be started is the far side's
+    /// (see `remote_tail`) -- and a tile that *is* a shell already has nothing to
+    /// outlive, so it still `exec`s outright with no wrapper left behind.
+    pub shell_after: bool,
     pub defaults: Defaults,
     /// Which group this tile is drawn under: an index into `Board::sections`.
     /// Entries are stored in drawing order, so a section is always one
@@ -229,44 +253,58 @@ impl Entry {
         &self.tint
     }
 
-    /// `d` has something to undo only when config.toml holds a block for it.
-    pub fn has_own_block(&self) -> bool {
-        matches!(self.origin, Some(Origin::Custom | Origin::SshOverridden))
-    }
-
-    /// The argv for one launch, with the chosen directory applied.
+    /// Where this tile lands, in the few columns a tile has spare -- the one
+    /// thing that tells two copies of one host apart.
     ///
-    /// Local commands just start there. For ssh the directory is on the far
-    /// side, so it becomes a remote command: `-t` forces a tty (without it the
-    /// remote shell is not interactive), and `exec $SHELL -l` replaces it so
-    /// you get a login shell in that folder rather than a bare `sh`.
-    pub fn argv_in(&self, dir: Option<&str>) -> Vec<String> {
-        let (Some(dir), Kind::Ssh) = (dir.filter(|d| !d.is_empty()), self.kind) else {
-            return self.argv.clone();
-        };
-        let mut argv = self.argv.clone();
-        argv.push("-t".into());
-        argv.push(format!("cd {} && exec ${{SHELL:-/bin/sh}} -l", sh_quote_path(dir)));
-        argv
-    }
-
-    /// A local tile's directory is applied by the launcher, not baked into
-    /// argv, so it is reported separately -- with `~` resolved, since the
-    /// launcher is a `chdir` or a quoted `cd` and neither expands it.
-    pub fn local_cwd(&self, dir: Option<&str>) -> Option<String> {
-        matches!(self.kind, Kind::Local)
-            .then_some(dir)
-            .flatten()
-            .filter(|d| !d.is_empty())
-            .map(expand_home)
+    /// The `command` is deliberately not here. A tile has room for one short
+    /// line, a command is the longer and less distinguishing half of the pair,
+    /// and the border is a place to read a *destination* rather than an argv.
+    pub fn note(&self) -> Option<String> {
+        self.folder.clone()
     }
 
     pub fn matches(&self, needle: &str) -> bool {
         let n = needle.to_lowercase();
-        self.label.to_lowercase().contains(&n)
-            || self.detail.to_lowercase().contains(&n)
-            || self.jump().is_some_and(|j| j.to_lowercase().contains(&n))
+        let has = |s: &str| s.to_lowercase().contains(&n);
+        has(&self.label)
+            || has(&self.detail)
+            || self.jump().is_some_and(has)
+            // A duplicate differs from its original in nothing else, so the
+            // filter has to be able to see the difference too.
+            || self.folder.as_deref().is_some_and(has)
+            || self.command.as_deref().is_some_and(has)
     }
+}
+
+/// The far side's login shell, which is what a session is when nothing else is
+/// asked of it -- and what it becomes again when what *was* asked of it ends.
+const REMOTE_SHELL: &str = "exec ${SHELL:-/bin/sh} -l";
+
+/// The tail that puts an ssh session in a directory, running something.
+///
+/// The directory is on the far side, so it cannot be a local `chdir`: it becomes
+/// a remote command instead. `-t` forces a tty -- without it the remote shell is
+/// not interactive -- and `exec $SHELL -l` is what leaves you in a login shell in
+/// the folder rather than a bare `sh`. A command of your own is passed as
+/// written: it is a line for the remote shell, and second-guessing it with an
+/// `exec` would break the ones that are more than a program name.
+///
+/// **The session outlives the command.** Your command runs and then the login
+/// shell takes over, because a command is not always something you sit in: `echo
+/// hi` prints one line and exits, and exec'ing it would close the session on the
+/// output it just produced. So it is a group followed by the shell, and the pair
+/// stays behind the `cd` -- a folder that isn't there should end the session with
+/// ssh's error, not drop you into a shell somewhere else.
+fn remote_tail(folder: Option<&str>, command: Option<&str>) -> Option<Vec<String>> {
+    let folder = folder.filter(|d| !d.is_empty()).map(sh_quote_path);
+    let command = command.filter(|c| !c.is_empty());
+    let script = match (folder, command) {
+        (Some(d), Some(c)) => format!("cd {d} && {{ {c}; {REMOTE_SHELL}; }}"),
+        (Some(d), None) => format!("cd {d} && {REMOTE_SHELL}"),
+        (None, Some(c)) => format!("{c}; {REMOTE_SHELL}"),
+        (None, None) => return None,
+    };
+    Some(vec!["-t".to_string(), script])
 }
 
 /// Resolve a leading `~` against the home directory, for a path this machine
@@ -274,7 +312,7 @@ impl Entry {
 ///
 /// Nothing downstream does it for us: a local folder becomes either a real
 /// `chdir` or a `cd` inside single quotes, and neither expands a tilde -- which
-/// is why `folders = ["~/Desktop"]` reported that the folder did not exist.
+/// is why `folder = "~/Desktop"` reported that the folder did not exist.
 pub use crate::platform::expand_home;
 
 /// Quote a path for a shell, leaving a leading `~` for that shell to expand.
@@ -377,6 +415,9 @@ fn from_ssh_config(h: ssh::Host, ov: Option<&HostEntry>) -> Entry {
         }
     }
     argv.push(h.alias.clone());
+    let folder = ov.and_then(|o| o.folder.clone()).filter(|f| !f.is_empty());
+    let command = ov.and_then(|o| o.command.clone()).filter(|c| !c.is_empty());
+    argv.extend(remote_tail(folder.as_deref(), command.as_deref()).unwrap_or_default());
 
     let pick = |over: Option<String>, base: &str| -> Option<String> {
         over.filter(|s| !s.is_empty()).or_else(|| (!base.is_empty()).then(|| base.to_string()))
@@ -401,7 +442,10 @@ fn from_ssh_config(h: ssh::Host, ov: Option<&HostEntry>) -> Entry {
         origin: Some(if ov.is_some() { Origin::SshOverridden } else { Origin::Ssh }),
         hidden: ov.is_some_and(|o| o.hidden),
         open_in: ov.and_then(|o| o.open_in),
-        folders: ov.map(|o| o.folders.clone()).unwrap_or_default(),
+        folder,
+        command,
+        cwd: None,
+        shell_after: false,
         kind: Kind::Ssh,
         label: h.alias,
         detail,
@@ -429,6 +473,9 @@ fn from_config(e: &HostEntry) -> Entry {
         argv.push(p.to_string());
     }
     argv.push(target.clone());
+    let folder = e.folder.clone().filter(|f| !f.is_empty());
+    let command = e.command.clone().filter(|c| !c.is_empty());
+    argv.extend(remote_tail(folder.as_deref(), command.as_deref()).unwrap_or_default());
 
     let detail = match e.port {
         Some(p) => format!("{target}:{p}"),
@@ -444,7 +491,10 @@ fn from_config(e: &HostEntry) -> Entry {
         origin: Some(Origin::Custom),
         hidden: e.hidden,
         open_in: e.open_in,
-        folders: e.folders.clone(),
+        folder,
+        command,
+        cwd: None,
+        shell_after: false,
         defaults: Defaults::default(),
         section: 0,
     }
@@ -452,23 +502,48 @@ fn from_config(e: &HostEntry) -> Entry {
 
 /// Local tiles first, then ssh hosts: the config's own, then yours -- the order
 /// tiles are in before any `[[section]]` block has a say.
+///
+/// A tile marked `deleted` is not built at all. It is not a tile in a state, it
+/// is a tile that is gone: nothing counts it, nothing colours around it, and
+/// nothing can put the cursor on it. The flag only exists because a host from
+/// `~/.ssh/config` has no block of ours to remove.
+///
+/// `hidden` is the opposite kind of thing and is built like any other tile.
+/// It is a state the tile is *in* -- drawn when `X` asks for it, counted in its
+/// group, holding its place in the arrangement -- so the decision about it is
+/// made in `App::visible`, once per frame, and not here.
 fn collect(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
     let mut entries: Vec<Entry> = cfg
         .locals
         .iter()
-        .map(|l| Entry {
-            tint: Tint::resolve(l.color.as_ref(), &l.label),
-            label: l.label.clone(),
-            detail: l.detail.clone(),
-            jump: None,
-            argv: split_command(&l.command),
-            kind: Kind::Local,
-            origin: None,
-            hidden: l.hidden,
-            open_in: l.open_in,
-            folders: l.folders.clone(),
-            defaults: Defaults::default(),
-            section: 0,
+        .filter(|l| !l.deleted)
+        .map(|l| {
+            let command = l.command.clone().filter(|c| !c.is_empty());
+            let folder = l.folder.clone().filter(|f| !f.is_empty());
+            // A tile with no command of its own is a shell on this machine,
+            // which is what a terminal would have opened anyway. Asked for only
+            // when it is needed: finding it is a PATH walk on Windows.
+            let argv = match &command {
+                Some(c) => split_command(c),
+                None => split_command(&platform::login_shell()),
+            };
+            Entry {
+                tint: Tint::resolve(l.color.as_ref(), &l.label),
+                label: l.label.clone(),
+                detail: l.detail.clone(),
+                jump: None,
+                argv,
+                kind: Kind::Local,
+                origin: None,
+                hidden: l.hidden,
+                open_in: l.open_in,
+                cwd: folder.as_deref().map(expand_home),
+                folder,
+                shell_after: command.is_some(),
+                command,
+                defaults: Defaults::default(),
+                section: 0,
+            }
         })
         .collect();
 
@@ -480,12 +555,20 @@ fn collect(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
             let ov = cfg.hosts.iter().find(|c| c.name == h.alias);
             if let Some(o) = ov {
                 claimed.push(&o.name);
+                // The block is the deletion, so the host it names is struck off
+                // the board -- while ~/.ssh/config keeps it, and so does ssh.
+                if o.deleted {
+                    continue;
+                }
             }
             entries.push(from_ssh_config(h, ov));
         }
     }
     entries.extend(
-        cfg.hosts.iter().filter(|h| !claimed.contains(&h.name.as_str())).map(from_config),
+        cfg.hosts
+            .iter()
+            .filter(|h| !h.deleted && !claimed.contains(&h.name.as_str()))
+            .map(from_config),
     );
 
     // Colours are only decidable once the whole screen is known.
@@ -545,6 +628,23 @@ mod tests {
     use super::*;
     use crate::config::HostEntry;
 
+    fn host_entry(name: &str) -> HostEntry {
+        HostEntry {
+            name: name.into(),
+            hostname: None,
+            user: None,
+            port: None,
+            jump: None,
+            color: None,
+            hidden: false,
+            deleted: false,
+            open_in: None,
+            folder: None,
+            command: None,
+            legacy_folders: Vec::new(),
+        }
+    }
+
     fn entry(
         name: &str,
         hostname: Option<&str>,
@@ -553,15 +653,11 @@ mod tests {
         jump: Option<&str>,
     ) -> Entry {
         from_config(&HostEntry {
-            name: name.into(),
             hostname: hostname.map(Into::into),
             user: user.map(Into::into),
             port,
             jump: jump.map(Into::into),
-            color: None,
-            hidden: false,
-            open_in: None,
-            folders: Vec::new(),
+            ..host_entry(name)
         })
     }
 
@@ -690,15 +786,9 @@ mod tests {
 
     fn override_for(name: &str, color: Option<&str>, user: Option<&str>) -> HostEntry {
         HostEntry {
-            name: name.into(),
-            hostname: None,
             user: user.map(Into::into),
-            port: None,
-            jump: None,
             color: color.map(Into::into),
-            hidden: false,
-            open_in: None,
-            folders: Vec::new(),
+            ..host_entry(name)
         }
     }
 
@@ -752,6 +842,36 @@ mod tests {
         assert_eq!(entries[0].tint().hex, "#9a68b0");
         assert_eq!(entries[0].origin(), Some(Origin::SshOverridden));
         assert_eq!(entries[1].origin(), Some(Origin::Custom));
+    }
+
+    /// Deleting a host from `~/.ssh/config` is the one deletion that cannot
+    /// take a block away, so it leaves one behind saying so -- and that block
+    /// must not draw a tile of its own instead.
+    #[test]
+    fn a_deleted_host_is_not_on_the_board_at_all() {
+        let dir = std::env::temp_dir().join("dasshboard-entry-deleted");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sshcfg = dir.join("config");
+        std::fs::write(&sshcfg, "Host alex\nHost csnhr\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.hosts.push(HostEntry { deleted: true, ..host_entry("csnhr") });
+        cfg.hosts.push(HostEntry { deleted: true, ..host_entry("gone") });
+        cfg.locals.push(crate::config::LocalEntry {
+            label: "box".into(),
+            detail: String::new(),
+            command: None,
+            color: None,
+            hidden: false,
+            deleted: true,
+            open_in: None,
+            folder: None,
+            legacy_folders: Vec::new(),
+        });
+
+        let names: Vec<String> =
+            build(&cfg, &sshcfg).entries.iter().map(|e| e.label().to_string()).collect();
+        assert_eq!(names, ["alex"], "only the host nobody deleted");
     }
 
     // ------------------------------------------------------------- sections
@@ -817,76 +937,148 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------- folders and commands
+
+    fn local(label: &str, command: Option<&str>, folder: Option<&str>) -> Entry {
+        let mut cfg = Config::default();
+        cfg.options.include_ssh_config = false;
+        cfg.locals.push(crate::config::LocalEntry {
+            label: label.into(),
+            detail: "local shell".into(),
+            command: command.map(Into::into),
+            color: None,
+            hidden: false,
+            deleted: false,
+            open_in: None,
+            folder: folder.map(Into::into),
+            legacy_folders: Vec::new(),
+        });
+        build(&cfg, Path::new("/nonexistent")).entries.remove(0)
+    }
+
+    fn remote(folder: Option<&str>, command: Option<&str>) -> Entry {
+        from_ssh_config(
+            ssh_host("alex"),
+            Some(&HostEntry {
+                folder: folder.map(Into::into),
+                command: command.map(Into::into),
+                ..host_entry("alex")
+            }),
+        )
+    }
+
     /// The remote directory can't be a local `cd`, so it becomes a remote
     /// command. `-t` is what makes it an interactive shell rather than a
     /// one-shot; `exec $SHELL -l` is what leaves you in a login shell there.
     #[test]
     fn an_ssh_folder_becomes_a_remote_command() {
-        let t = from_ssh_config(ssh_host("alex"), None);
-        let argv = t.argv_in(Some("/scratch/project"));
-        assert_eq!(argv[..2], ["ssh", "alex"], "the alias still leads");
-        assert_eq!(argv[2], "-t", "a tty is required for an interactive shell");
-        assert_eq!(argv[3], "cd '/scratch/project' && exec ${SHELL:-/bin/sh} -l");
-        assert!(t.local_cwd(Some("/scratch/project")).is_none(), "not a local cd");
+        let t = remote(Some("/scratch/project"), None);
+        assert_eq!(t.argv[..2], ["ssh", "alex"], "the alias still leads");
+        assert_eq!(t.argv[2], "-t", "a tty is required for an interactive shell");
+        assert_eq!(t.argv[3], "cd '/scratch/project' && exec ${SHELL:-/bin/sh} -l");
+        assert!(t.cwd.is_none(), "not a local cd");
+    }
+
+    /// A command of your own runs instead of the login shell, and rides along
+    /// with the folder when there is one -- but the shell still follows it, so
+    /// the session outlives a command that exits.
+    #[test]
+    fn an_ssh_command_runs_before_the_login_shell() {
+        let t = remote(None, Some("tmux attach"));
+        assert_eq!(t.argv, ["ssh", "alex", "-t", "tmux attach; exec ${SHELL:-/bin/sh} -l"]);
+        // Written as given: it is a line for the remote shell, and the ones that
+        // are more than a program name would not survive being second-guessed.
+        // The braces are why: without them the `&&` would reach past the group
+        // and the shell would start whether the command ran or not.
+        let both = remote(Some("~/proj"), Some("tmux attach || tmux new"));
+        assert_eq!(
+            both.argv[3],
+            "cd ~/'proj' && { tmux attach || tmux new; exec ${SHELL:-/bin/sh} -l; }"
+        );
+    }
+
+    /// The point of the tail: a command that prints a line and exits leaves a
+    /// session you can still type in, rather than a surface that closed on its
+    /// own output.
+    #[test]
+    fn a_command_that_exits_still_leaves_a_shell() {
+        let t = remote(None, Some("echo hi"));
+        assert!(t.argv[3].starts_with("echo hi; "), "the command runs first: {}", t.argv[3]);
+        assert!(t.argv[3].ends_with(REMOTE_SHELL), "and the shell has the session after it");
+        // A folder puts both behind the `cd`: a directory that is not there
+        // should end the session with ssh's error, not open a shell elsewhere.
+        let d = remote(Some("/srv/app"), Some("echo hi"));
+        assert_eq!(d.argv[3], "cd '/srv/app' && { echo hi; exec ${SHELL:-/bin/sh} -l; }");
     }
 
     #[test]
-    fn no_folder_leaves_the_command_untouched() {
-        let t = from_ssh_config(ssh_host("alex"), None);
-        assert_eq!(t.argv_in(None), t.argv);
-        assert_eq!(t.argv_in(Some("")), t.argv, "an empty choice is no choice");
+    fn neither_folder_nor_command_leaves_the_ssh_args_alone() {
+        assert_eq!(from_ssh_config(ssh_host("alex"), None).argv, ["ssh", "alex"]);
+        assert_eq!(remote(Some(""), Some("")).argv, ["ssh", "alex"], "empty is not a value");
     }
 
     /// A quote in a path must not break out of the remote command.
     #[test]
     fn a_quote_in_a_remote_path_stays_quoted() {
-        let t = from_ssh_config(ssh_host("alex"), None);
-        let argv = t.argv_in(Some("/od'd"));
-        assert!(argv[3].contains(r"'/od'\''d'"), "got {}", argv[3]);
+        let t = remote(Some("/od'd"), None);
+        assert!(t.argv[3].contains(r"'/od'\''d'"), "got {}", t.argv[3]);
     }
 
     /// A local tile's folder is a real chdir, not part of argv, so the command
     /// stays exactly what was configured.
     #[test]
     fn a_local_folder_is_a_cwd_not_an_argument() {
-        let mut cfg = Config::default();
-        cfg.options.include_ssh_config = false;
-        cfg.locals.push(crate::config::LocalEntry {
-            label: "MACBOOK".into(),
-            detail: "local shell".into(),
-            command: "/bin/zsh".into(),
-            color: None,
-            hidden: false,
-            open_in: None,
-            folders: vec!["~/code/app".into()],
-        });
-        let entries = build(&cfg, Path::new("/nonexistent")).entries;
-        let t = &entries[0];
-        assert_eq!(t.folders, ["~/code/app"], "the config keeps the ~, for display");
-        assert_eq!(t.argv_in(Some("~/code/app")), ["/bin/zsh"], "argv unchanged");
+        let t = local("MACBOOK", Some("/bin/zsh"), Some("~/code/app"));
+        assert_eq!(t.folder.as_deref(), Some("~/code/app"), "the config keeps the ~, for display");
+        assert_eq!(t.argv, ["/bin/zsh"], "argv unchanged");
         // ...but what gets chdir'd into is a real path: nothing downstream of
         // here expands a tilde.
         let home = std::env::var("HOME").unwrap();
-        assert_eq!(t.local_cwd(Some("~/code/app")).as_deref(), Some(&*format!("{home}/code/app")));
-        assert_eq!(t.local_cwd(Some("~")).as_deref(), Some(&*home), "bare ~ is home");
+        assert_eq!(t.cwd.as_deref(), Some(&*format!("{home}/code/app")));
+        assert_eq!(local("m", None, Some("~")).cwd.as_deref(), Some(&*home), "bare ~ is home");
         assert_eq!(
-            t.local_cwd(Some("/tmp/x")).as_deref(),
+            local("m", None, Some("/tmp/x")).cwd.as_deref(),
             Some("/tmp/x"),
             "an absolute path is left alone"
         );
         assert_eq!(
-            t.local_cwd(Some("~notauser/x")).as_deref(),
+            local("m", None, Some("~notauser/x")).cwd.as_deref(),
             Some("~notauser/x"),
             "~user is not ours to guess at"
         );
+    }
+
+    /// A local tile with no command is a shell on this machine, which is what
+    /// the terminal would have opened anyway.
+    #[test]
+    fn a_local_tile_with_no_command_runs_the_login_shell() {
+        let t = local("MACBOOK", None, None);
+        assert_eq!(t.argv, split_command(&crate::platform::login_shell()));
+        assert!(t.command.is_none(), "nothing to show on the tile");
+        assert!(t.cwd.is_none(), "and nowhere in particular to start");
+    }
+
+    /// The local half of the same promise. A tile that *is* a shell has nothing
+    /// to outlive and still execs outright; a tile with a command of its own is
+    /// followed by a shell, because `echo hi` is a session that would otherwise
+    /// end on the line it just printed.
+    #[test]
+    fn a_local_command_is_followed_by_a_shell_and_a_bare_shell_is_not() {
+        assert!(!local("MACBOOK", None, None).shell_after, "a shell is its own session");
+        for c in ["echo hi", "nvim", "herdr"] {
+            let t = local("MACBOOK", Some(c), None);
+            assert!(t.shell_after, "{c} may exit, and the terminal has to survive it");
+            assert_eq!(t.argv, split_command(c), "argv is still exactly what was configured");
+        }
+        // The far side runs its own shell, inside the remote command.
+        assert!(!remote(None, Some("echo hi")).shell_after, "not this machine's business");
     }
 
     /// A remote home is on the far side, so the tilde has to reach the remote
     /// shell as syntax -- while the rest of the path stays quoted.
     #[test]
     fn a_remote_tilde_survives_the_quoting() {
-        let t = from_ssh_config(ssh_host("alex"), None);
-        let cmd = |d| t.argv_in(Some(d))[3].clone();
+        let cmd = |d: &str| remote(Some(d), None).argv[3].clone();
         assert_eq!(cmd("~/thesis"), "cd ~/'thesis' && exec ${SHELL:-/bin/sh} -l");
         assert_eq!(cmd("~"), "cd ~ && exec ${SHELL:-/bin/sh} -l");
         assert_eq!(cmd("~/my dir"), "cd ~/'my dir' && exec ${SHELL:-/bin/sh} -l");
@@ -894,6 +1086,22 @@ mod tests {
         // still one quoted word.
         assert_eq!(cmd("~/od'd && rm -rf x"), r"cd ~/'od'\''d && rm -rf x' && exec ${SHELL:-/bin/sh} -l");
         assert_eq!(cmd("~notauser/x"), "cd '~notauser/x' && exec ${SHELL:-/bin/sh} -l");
+    }
+
+    /// Two tiles for one host differ in nothing but where they land, so that is
+    /// what the screen and the filter have to go on.
+    #[test]
+    fn a_duplicates_folder_is_what_tells_it_apart() {
+        let t = remote(Some("~/thesis"), Some("tmux attach"));
+        assert_eq!(t.note().as_deref(), Some("~/thesis"), "the folder, not the argv");
+        assert_eq!(
+            remote(None, Some("tmux attach")).note(),
+            None,
+            "a command alone says nothing about where the tile goes"
+        );
+        assert!(t.matches("thesis"), "the filter can see the folder");
+        assert!(t.matches("tmux"));
+        assert!(from_ssh_config(ssh_host("alex"), None).note().is_none(), "nothing to say");
     }
 }
 

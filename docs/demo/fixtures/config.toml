@@ -1,0 +1,48 @@
+# A made-up config.toml, for the README's recordings only.
+
+[options]
+include_ssh_config = true
+tint_tabs = true
+tab_emoji = true
+show_hidden = false
+open_in = "tab"
+
+[theme]
+primary = "#aaaaaa"
+accent = "#ff0000"
+
+[[local]]
+label = "WORKSTATION"
+detail = "local shell"
+folder = "~/projects/aurora"
+
+# A command that is not something you sit in: it prints and exits, and the
+# session it opened stays behind as a shell in the same folder.
+[[local]]
+label = "NOTES"
+detail = "today's page"
+folder = "~/notes"
+command = "cat today.md"
+
+[[host]]
+name = "orion"
+folder = "/scratch/aurora"
+
+[[host]]
+name = "orion-2"
+hostname = "orion.hpc.example.edu"
+user = "a3417291"
+folder = "~/thesis"
+command = "tmux attach"
+
+[[host]]
+name = "nas"
+color = "#4f8ab0"
+
+[[section]]
+title = "work"
+items = ["orion", "orion-2", "gateway", "builder"]
+
+[[section]]
+title = "home"
+items = ["WORKSTATION", "NOTES", "nas", "pi-garden"]

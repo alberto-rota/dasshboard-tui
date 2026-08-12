@@ -20,8 +20,15 @@ const TITLE_H: u16 = 2;
 const CELL_W: u16 = 38;
 const MAX_COLS: usize = 4;
 /// Rows of chrome around the grid: wordmark, blank, rule, blank, then a blank
-/// and two footer rows below it.
+/// and the two footer rows below it.
 const CHROME_H: u16 = 7;
+/// The keys and the status line, pinned to the bottom edge of the terminal.
+///
+/// The footer used to travel with the centred block, which put it directly
+/// under the last row of tiles -- so it moved up and down the screen as tiles
+/// were added, hidden or filtered. It is a fixed reference, not part of the
+/// board, so it stays where a fixed reference belongs.
+const FOOTER_H: u16 = 2;
 const PAD: u16 = 2;
 
 /// One drawn row of the grid.
@@ -125,11 +132,12 @@ fn place(full: Rect, cols: usize, rows: &[GridRow]) -> Placement {
     // of nothing but empty groups must not push the grid off the bottom.
     let grid_h = grid_h.clamp(1, for_grid.max(CELL_H)).max(CELL_H.min(for_grid.max(1)));
 
-    // Vertically centre the whole block; fall back to the top when it overflows.
-    // The grid's last row is a gutter, which doubles as the blank above the
-    // footer, so it is not part of the visible height.
-    let content_h = grid_h - 1 + CHROME_H;
-    let y = full.y + full.height.saturating_sub(content_h) / 2;
+    // Centre the wordmark, the rule and the grid in what is left once the
+    // footer has taken the bottom edge; fall back to the top when it overflows.
+    // The grid's last row is a gutter, so it is not part of the visible height.
+    let content_h = grid_h - 1 + (CHROME_H - FOOTER_H);
+    let above_footer = full.height.saturating_sub(FOOTER_H);
+    let y = full.y + above_footer.saturating_sub(content_h) / 2;
 
     Placement { x: full.x + full.width.saturating_sub(width) / 2, y, width, cell_w, grid_h }
 }
@@ -150,7 +158,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_rule(f, row(2, 1), th);
     let grid = row(4, p.grid_h);
     draw_grid(f, app, grid, &vis, &rows, &p, th);
-    draw_footer(f, app, row(4 + grid.height, 2), th);
+    // On the bottom edge rather than under the last row of tiles: the keys do
+    // not change when the board does, so neither should where you look for them.
+    // Still on the grid's left margin, so the page keeps one column.
+    //
+    // `max` against the row below the grid, not a bare bottom edge: on a
+    // terminal too short to hold the board *and* the footer, the bottom edge is
+    // somewhere in the middle of the grid, and keys printed over tiles would be
+    // worse than keys pushed off the screen.
+    let footer_y =
+        (grid.y + grid.height).max(full.y + full.height.saturating_sub(FOOTER_H));
+    draw_footer(
+        f,
+        app,
+        Rect {
+            x: p.x,
+            y: footer_y,
+            width: p.width,
+            height: FOOTER_H.min((full.y + full.height).saturating_sub(footer_y)),
+        },
+        th,
+    );
 
     match &app.mode {
         Mode::Add(form) | Mode::Edit(form) => {
@@ -159,13 +187,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Mode::ConfirmDelete(i) => {
             dim_behind(f, full, th);
-            let reverting = app.entries[*i].origin() == Some(Origin::SshOverridden);
-            draw_confirm(f, full, app.entries[*i].label(), reverting, th);
-        }
-        Mode::Folders { entry, sel, .. } => {
-            dim_behind(f, full, th);
-            let e = &app.entries[*entry];
-            draw_folders(f, full, &e.label, &e.folders, *sel, th);
+            let from_ssh = matches!(
+                app.entries[*i].origin(),
+                Some(Origin::Ssh | Origin::SshOverridden)
+            );
+            draw_confirm(f, full, app.entries[*i].label(), from_ssh, th);
         }
         Mode::Settings { focus, buf } => {
             dim_behind(f, full, th);
@@ -415,6 +441,8 @@ fn draw_tile(
         (false, false, true) => (BorderType::Rounded, th.primary, th.bright),
         (false, false, false) => (BorderType::Rounded, th.faint, th.primary),
     };
+    // A tile you have put away reads as put away even while you are looking at
+    // it, or the two states would be one state with a tag on it.
     if entry.hidden() && !sel {
         label_color = th.muted;
     }
@@ -435,16 +463,32 @@ fn draw_tile(
             .left_aligned(),
         );
     }
+    // Where this tile lands, along the bottom edge: two tiles for one host are
+    // the same host, and this is the whole of the difference between them. On the
+    // border rather than inside, because the two rows in there are already spent
+    // on who it is and how it connects.
+    if let Some(note) = entry.note() {
+        let room = (area.width as usize).saturating_sub(6);
+        block = block.title_bottom(
+            Line::styled(
+                format!(" {} ", fit(&note, room)),
+                Style::default().fg(if sel { th.primary } else { th.muted }),
+            )
+            .right_aligned(),
+        );
+    }
     if moving {
         block = block
             .title_top(Line::styled(" moving ", Style::default().fg(th.accent)).right_aligned());
+    } else if entry.hidden() {
+        // Ahead of `local`, because there is one tag slot and this is the one
+        // you turned X on to find. A tile is only ever drawn hidden while you
+        // are looking for hidden tiles, so it is what tells them from the rest.
+        block = block
+            .title_top(Line::styled(" hidden ", Style::default().fg(th.accent_dim)).right_aligned());
     } else if entry.is_local() {
         block = block
             .title_top(Line::styled(" local ", Style::default().fg(th.accent_dim)).right_aligned());
-    } else if entry.hidden() {
-        // Only ever seen with show_hidden on, which is how you get one back.
-        block = block
-            .title_top(Line::styled(" hidden ", Style::default().fg(th.accent_dim)).right_aligned());
     }
 
     let inner = block.inner(area);
@@ -489,11 +533,26 @@ fn draw_tile(
     f.render_widget(Paragraph::new(vec![name, Line::from(detail)]), inner);
 }
 
-fn key_hints(th: &Theme, pairs: &[(&str, &str)]) -> Line<'static> {
+/// The footer, cut at a hint boundary rather than mid-word.
+///
+/// There are more keys than a three-column terminal has room for, and a line
+/// that simply overflows ends in `q she` -- which reads as a key nobody has.
+/// Dropping whole hints from the end keeps every hint on screen true, and the
+/// list is ordered so that what falls off first is what you need least.
+/// `width` of 0 means "no limit", for the modes whose footer always fits.
+fn key_hints(th: &Theme, pairs: &[(&str, &str)], width: u16) -> Line<'static> {
+    const GAP: usize = 3;
     let mut spans = Vec::new();
+    let mut used = 0usize;
     for (i, (key, what)) in pairs.iter().enumerate() {
+        let hint = width_of(key) + 1 + width_of(what);
+        let gap = if i > 0 { GAP } else { 0 };
+        if width > 0 && used + gap + hint > width as usize {
+            break;
+        }
+        used += gap + hint;
         if i > 0 {
-            spans.push(Span::raw("   "));
+            spans.push(Span::raw(" ".repeat(GAP)));
         }
         spans.push(Span::styled(key.to_string(), Style::default().fg(th.primary)));
         spans.push(Span::styled(format!(" {what}"), Style::default().fg(th.faint)));
@@ -517,25 +576,32 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
             // to make: with nothing able to open a tab, t/w/c all mean ⏎.
             let mut hints = vec![("⏎", "open")];
             if app.backend.can_spawn() {
-                hints.push(("t/w/c", "tab·win·here"));
+                hints.push(("t/w/c", "where"));
             }
+            // Grouped as the keys are: find, then the ones that change the
+            // board, then the two panels, then the way out. `x` and `X` share
+            // a hint because they are one idea -- put away, and look at what is
+            // put away -- and the pair costs the room a single hint does.
             hints.extend([
                 ("/", "find"),
                 ("a", "add"),
                 ("e", "edit"),
+                ("y", "dup"),
+                ("d", "delete"),
+                ("x/X", "hide"),
                 ("m", "move"),
                 ("S", "groups"),
-                ("x", "hide"),
                 ("s", "settings"),
                 ("q", "shell"),
             ]);
-            key_hints(th, &hints)
+            key_hints(th, &hints, area.width)
         }
         // The one mode with no modal in front of it, so the footer is the only
         // place that can say the arrows have stopped moving the cursor.
         Mode::Move => key_hints(
             th,
             &[("←→", "reorder"), ("↑↓", "by a row"), ("g/G", "to an end"), ("⏎", "drop")],
+            area.width,
         ),
         _ => Line::raw(""),
     };
@@ -582,9 +648,9 @@ fn modal_block(title: &str, th: &Theme) -> Block<'static> {
 
 // ------------------------------------------------------------------- form
 
-pub const HOST_FIELDS: [&str; 6] =
-    ["name", "hostname", "user", "port", "jump", "folders"];
-pub const LOCAL_FIELDS: [&str; 4] = ["label", "command", "detail", "folders"];
+pub const HOST_FIELDS: [&str; 7] =
+    ["name", "hostname", "user", "port", "jump", "folder", "command"];
+pub const LOCAL_FIELDS: [&str; 4] = ["label", "command", "detail", "folder"];
 
 pub struct Field {
     pub key: &'static str,
@@ -722,16 +788,22 @@ impl Form {
         }
     }
 
-    /// Swap the field set, carrying across the two things both kinds have.
+    /// Swap the field set, carrying across the three things both kinds have.
     pub fn switch_block(&mut self, block: CfgBlock) {
         if self.kind_locked || self.block == block {
             return;
         }
-        let (name, folders) = (self.fields[0].value.clone(), self.field("folders").to_string());
+        let carried: Vec<(&str, String)> = ["folder", "command"]
+            .iter()
+            .map(|k| (*k, self.field(k).to_string()))
+            .collect();
+        let name = self.fields[0].value.clone();
         self.block = block;
         self.fields = Form::fields_for(block);
         self.fields[0].value = name;
-        self.set("folders", folders);
+        for (key, value) in carried {
+            self.set(key, value);
+        }
         self.focus = KIND_ROW;
     }
 
@@ -754,16 +826,6 @@ impl Form {
         let cur = self.open_in.map_or(0, |o| o.index() as i32 + 1);
         let next = (cur + if forward { 1 } else { -1 }).rem_euclid(n + 1);
         self.open_in = (next > 0).then(|| OpenIn::ALL[(next - 1) as usize]);
-    }
-
-    /// Folders are typed as one comma-separated line; splitting here keeps the
-    /// form a flat list of text rows instead of a nested editor.
-    pub fn folder_list(&self) -> Vec<String> {
-        self.field("folders")
-            .split(',')
-            .map(|f| f.trim().to_string())
-            .filter(|f| !f.is_empty())
-            .collect()
     }
 }
 
@@ -822,10 +884,13 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form, spawns: bool, th: &Theme) {
         } else {
             match field.key {
                 "name" | "label" => "required".into(),
-                "command" => "required, e.g. /bin/zsh".into(),
+                "command" => match form.block {
+                    CfgBlock::Local => format!("{}  login shell", crate::platform::login_shell()),
+                    CfgBlock::Host => "login shell, on the far side".into(),
+                },
                 "hostname" => "defaults to name".into(),
                 "port" => "22".into(),
-                "folders" => "comma separated; more than one asks".into(),
+                "folder" => "~  home — one per tile, y duplicates".into(),
                 _ => "optional".into(),
             }
         };
@@ -880,7 +945,7 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form, spawns: bool, th: &Theme) {
             Style::default().fg(if form.hidden { th.primary } else { th.faint }),
         ),
         Span::styled(
-            if form.hidden { "   off the home screen" } else { "" },
+            if form.hidden { "   off the board until X" } else { "" },
             Style::default().fg(th.muted),
         ),
         Span::styled(if on { "   space toggle" } else { "" }, Style::default().fg(th.faint)),
@@ -919,52 +984,13 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form, spawns: bool, th: &Theme) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The folder picker, shown when a tile has somewhere to start.
-fn draw_folders(f: &mut Frame, area: Rect, label: &str, folders: &[String], sel: usize, th: &Theme) {
-    let rows = folders.len() + 1;
-    let area = modal_area(f, area, 60, rows as u16 + 5);
-    let block = modal_block(&format!("open {label} in"), th);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let mut lines = vec![Line::raw("")];
-    // Index 0 is always "no folder", so a configured host is never forced
-    // somewhere -- home stays one keystroke away.
-    for (i, item) in std::iter::once(&"~".to_string()).chain(folders).enumerate() {
-        let on = i == sel;
-        let (text, dim) = if i == 0 {
-            ("home".to_string(), "no cd".to_string())
-        } else {
-            let leaf = item.rsplit('/').next().unwrap_or(item).to_string();
-            (leaf, item.clone())
-        };
-        lines.push(Line::from(vec![
-            Span::styled(if on { " ▌ " } else { "   " }, Style::default().fg(th.accent)),
-            Span::styled(
-                format!("{} ", if i < 9 { (b'1' + i as u8) as char } else { ' ' }),
-                Style::default().fg(th.faint),
-            ),
-            Span::styled(
-                format!("{text:<18}"),
-                Style::default().fg(if on { th.bright } else { th.primary }),
-            ),
-            Span::styled(dim, Style::default().fg(th.muted)),
-        ]));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::raw("   "),
-        Span::styled("↑↓ move   1-9 jump   ⏎ open   esc cancel", Style::default().fg(th.faint)),
-    ]));
-
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
 // ----------------------------------------------------------- other modals
 
-fn draw_confirm(f: &mut Frame, area: Rect, label: &str, reverting: bool, th: &Theme) {
+/// `from_ssh` is the one case worth spelling out: that host is ssh's, not ours,
+/// so the deletion says what it does *not* touch.
+fn draw_confirm(f: &mut Frame, area: Rect, label: &str, from_ssh: bool, th: &Theme) {
     let area = modal_area(f, area, 52, 6);
-    let block = modal_block(if reverting { "revert" } else { "delete" }, th);
+    let block = modal_block("delete", th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -973,33 +999,27 @@ fn draw_confirm(f: &mut Frame, area: Rect, label: &str, reverting: bool, th: &Th
             Line::raw(""),
             Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    if reverting { "drop customisation for " } else { "remove " },
-                    Style::default().fg(th.primary),
-                ),
+                Span::styled("delete ", Style::default().fg(th.primary)),
                 Span::styled(
                     label.to_string(),
                     Style::default().fg(th.bright).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    if reverting { "?" } else { " from config.toml?" },
+                    if from_ssh { " from the home screen?" } else { " from config.toml?" },
                     Style::default().fg(th.primary),
                 ),
             ]),
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    if reverting { "the tile stays, from ~/.ssh/config" } else { "" },
+                    if from_ssh { "~/.ssh/config is not touched — the host still works" } else { "" },
                     Style::default().fg(th.faint),
                 ),
             ]),
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled("y", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    if reverting { " revert    " } else { " delete    " },
-                    Style::default().fg(th.faint),
-                ),
+                Span::styled(" delete    ", Style::default().fg(th.faint)),
                 Span::styled("n", Style::default().fg(th.primary)),
                 Span::styled(" keep", Style::default().fg(th.faint)),
             ]),

@@ -49,7 +49,12 @@ fn main() -> io::Result<()> {
     // Only reached once the terminal is back to normal, so the handed-off
     // program starts on a clean screen and owns this terminal from here on.
     if let Some(argv) = app.handoff {
-        hand_off(&argv, app.handoff_cwd.as_deref());
+        hand_off(
+            &argv,
+            app.handoff_cwd.as_deref(),
+            app.handoff_title.as_deref(),
+            app.handoff_shell_after,
+        );
     }
     Ok(())
 }
@@ -65,23 +70,62 @@ fn main() -> io::Result<()> {
 /// `SKIP_VAR` goes into the environment because a local tile usually runs a
 /// shell, and that shell reads the same rc that started us -- without it, the
 /// first thing it would do is draw a second home screen inside the first.
-fn hand_off(argv: &[String], cwd: Option<&str>) -> ! {
+///
+/// `title` renames the surface we are handing over. A tab this program *opens*
+/// is titled by the command it runs there; a tab it takes over would otherwise
+/// keep the name of the terminal that opened the home screen, so the one tile
+/// that lands here would be the one tile the tab bar could not tell you about.
+/// It is written after the TUI is torn down and before the exec, which is the
+/// only moment this process owns a plain terminal.
+///
+/// `shell_after` is the one path that does not `exec`: a tile whose command
+/// exits -- `echo hi`, a script, anything that is not something you sit in --
+/// would otherwise print into a terminal it hands straight back, which reads as
+/// a home screen that blinked and vanished. There the command is run, waited
+/// for, and the shell that follows it is what this terminal becomes.
+fn hand_off(argv: &[String], cwd: Option<&str>, title: Option<&str>, shell_after: bool) -> ! {
+    if let Some(t) = title {
+        launch::rename_current_tab(t);
+    }
     if let Some(dir) = cwd {
         if let Err(e) = std::env::set_current_dir(dir) {
             eprintln!("dasshboard: could not enter {dir}: {e}");
             std::process::exit(1);
         }
     }
+
+    if shell_after {
+        // A session that never started has nothing to outlive, so a command
+        // that cannot be run is still the same error it always was.
+        if let Err(e) = session(argv).status() {
+            eprintln!("dasshboard: could not run {}: {e}", argv[0]);
+            std::process::exit(1);
+        }
+        let shell = platform::login_shell();
+        let mut after = session(std::slice::from_ref(&shell));
+        after.env(launch::NO_WORKSPACE_VAR, "1");
+        become_process(&mut after, &shell);
+    }
+    become_process(&mut session(argv), &argv[0]);
+}
+
+/// The command for a session, marked so the shell it may start doesn't draw a
+/// second home screen inside this one.
+fn session(argv: &[String]) -> Command {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).env(launch::SKIP_VAR, "1");
+    cmd
+}
 
+/// Give this terminal to `cmd`, for good.
+fn become_process(cmd: &mut Command, what: &str) -> ! {
     // Unix replaces this process outright, so nothing of dasshboard survives to
     // be waited on.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
-        eprintln!("dasshboard: could not run {}: {err}", argv[0]);
+        eprintln!("dasshboard: could not run {what}: {err}");
         std::process::exit(1);
     }
 
@@ -93,7 +137,7 @@ fn hand_off(argv: &[String], cwd: Option<&str>) -> ! {
     match cmd.status() {
         Ok(st) => std::process::exit(st.code().unwrap_or(0)),
         Err(e) => {
-            eprintln!("dasshboard: could not run {}: {e}", argv[0]);
+            eprintln!("dasshboard: could not run {what}: {e}");
             std::process::exit(1);
         }
     }
@@ -110,16 +154,20 @@ fn run_cli() -> io::Result<Option<i32>> {
             if let Some(e) = err {
                 eprintln!("{e}");
             }
+            // Hidden tiles are printed, marked: this exists to show what is
+            // configured, and a hidden tile is configured. A deleted one is not
+            // built at all, so it cannot appear here either way.
             for e in entry::build(&cfg, &ssh::default_config_path()).entries {
                 let kind = if e.is_local() { "local" } else { "ssh" };
                 let mark = if e.hidden() { "hidden" } else { "" };
                 let t = e.tint();
                 println!(
-                    "{kind:<6} {} {:<8} {:<16} {:<28} {mark}",
+                    "{kind:<6} {} {:<8} {:<16} {:<28} {:<26} {mark}",
                     t.emoji,
                     t.hex,
                     e.label(),
-                    e.detail()
+                    e.detail(),
+                    e.note().unwrap_or_default(),
                 );
             }
             Ok(Some(0))
@@ -150,11 +198,15 @@ fn run_cli() -> io::Result<Option<i32>> {
             };
             // Without a terminal that opens tabs for us there is nowhere else to
             // put it, so `--open` becomes what it means in a shell: connect,
-            // here, in place of this command.
+            // here, in place of this command -- naming the tab on the way, as
+            // the tab it would have opened would have been named.
             if !launch::backend().can_spawn() {
-                hand_off(&argv, None);
+                let title = launch::tab_title(&name, emoji);
+                // Only ssh tiles are reachable here, and an ssh session carries
+                // its own follow-on shell in the remote command.
+                hand_off(&argv, None, Some(&title), false);
             }
-            match launch::spawn(where_to, &name, &argv, None, hex.as_deref(), emoji) {
+            match launch::spawn(where_to, &name, &argv, None, hex.as_deref(), emoji, false) {
                 Ok(id) => {
                     println!("{id}");
                     Ok(Some(0))
@@ -334,21 +386,20 @@ mod tests {
         println!("=== add form ===\n{add}");
         let (_, del) = frame(120, 30, |a| a.mode = Mode::ConfirmDelete(0));
         println!("=== confirm ===\n{del}");
-        let (_, pick) = frame(120, 32, |a| {
-            if let Some(i) = a.entries.iter().position(|e| !e.hidden()) {
-                a.entries[i].folders =
-                    vec!["/scratch/atlas".into(), "/home/v120bb18/thesis".into()];
-                let vis = a.visible();
-                a.sel = vis.iter().position(|&x| x == i).unwrap();
-                a.on_key(
-                    ratatui::crossterm::event::KeyEvent::from(
-                        ratatui::crossterm::event::KeyCode::Enter,
-                    ),
-                    &vis,
-                );
+        let (_, placed) = frame(120, 32, |a| {
+            for (n, i) in a.visible().into_iter().enumerate() {
+                match n {
+                    0 => a.entries[i].folder = Some("/home/v120bb18/thesis".into()),
+                    1 => a.entries[i].command = Some("tmux attach".into()),
+                    2 => {
+                        a.entries[i].folder = Some("~/dasshboard-tui".into());
+                        a.entries[i].command = Some("nvim".into());
+                    }
+                    _ => {}
+                }
             }
         });
-        println!("=== folder picker ===\n{pick}");
+        println!("=== folders and commands on the tiles ===\n{placed}");
         let (_, edit) = frame(120, 30, |a| {
             let vis = a.visible();
             if let Some(s) = vis.iter().position(|&i| a.entries[i].origin().is_some()) {
@@ -362,6 +413,13 @@ mod tests {
             }
         });
         println!("=== edit an ssh-config host ===\n{edit}");
+        let (_, revealed) = frame(120, 32, |a| {
+            a.show_hidden = true;
+            if let Some(e) = a.entries.first_mut() {
+                e.hidden = true;
+            }
+        });
+        println!("=== hidden tiles, revealed by X ===\n{revealed}");
         let (_, set) = frame(120, 30, |a| a.mode = Mode::Settings { focus: 5, buf: "#aaaaaa".into() });
         println!("=== settings ===\n{set}");
         let (_, filt) = frame(120, 30, |a| {
@@ -403,10 +461,20 @@ mod tests {
         }
     }
 
+    /// What you can see, you can click -- one hitbox per tile the grid actually
+    /// drew. Not per *visible* tile: a board taller than the terminal scrolls,
+    /// and the tiles below the fold have no place on screen to be clicked.
     #[test]
     fn every_tile_is_clickable_and_none_overlap() {
         let (app, _) = frame(120, 30, |_| {});
-        assert_eq!(app.hitboxes.len(), app.visible().len());
+        let drawn: usize = app.tile_rows.iter().map(|r| r.len()).sum();
+        assert_eq!(app.hitboxes.len(), drawn, "one hitbox per drawn tile");
+        assert!(drawn <= app.visible().len());
+
+        // ...and on a screen with room for the whole board, that is all of them.
+        let (big, _) = frame(180, 60, |_| {});
+        assert_eq!(big.hitboxes.len(), big.visible().len(), "nothing is left unclickable");
+
         for (i, (a, _)) in app.hitboxes.iter().enumerate() {
             for (b, _) in &app.hitboxes[i + 1..] {
                 let disjoint = a.x + a.width <= b.x
@@ -419,14 +487,31 @@ mod tests {
     }
 
     /// Tiles must stay inside the drawing area at any size, or the grid bleeds
-    /// over the footer.
+    /// over the footer. And the footer, now that it lives on the bottom edge
+    /// rather than under the last row of tiles, must not bleed the other way:
+    /// it gives up the bottom edge rather than print the keys over a tile.
+    ///
+    /// Below 30x10 a single tile is taller than the room there is for one, and
+    /// the layout says outright that it would rather overflow than draw
+    /// nothing -- so that is not a size this asserts anything about.
     #[test]
     fn tiles_never_escape_the_viewport() {
         for (w, h) in [(150u16, 40u16), (120, 30), (80, 24), (44, 14), (30, 10)] {
-            let (app, _) = frame(w, h, |_| {});
+            let (app, out) = frame(w, h, |_| {});
             for (r, _) in &app.hitboxes {
                 assert!(r.x + r.width <= w, "{w}x{h}: {r:?} past right edge");
                 assert!(r.y + r.height <= h, "{w}x{h}: {r:?} past bottom edge");
+            }
+            // Nothing is drawn twice into one cell, which is what an overlap of
+            // the two would look like: a tile border with letters through it.
+            let rows: Vec<&str> = out.lines().collect();
+            let bottom_of_grid =
+                app.hitboxes.iter().map(|(r, _)| r.y + r.height - 1).max().unwrap_or(0);
+            for (y, row) in rows.iter().enumerate().take(bottom_of_grid as usize) {
+                assert!(
+                    !row.contains(" open ") || y as u16 >= bottom_of_grid,
+                    "{w}x{h}: the footer landed on row {y}, inside the grid"
+                );
             }
         }
     }
@@ -439,19 +524,26 @@ mod tests {
     fn open_in_current_hands_off_instead_of_spawning() {
         use config::OpenIn;
         let mut app = App::new();
-        let Some(i) = app.entries.iter().position(|e| !e.hidden()) else { return };
+        if app.entries.is_empty() {
+            return;
+        }
+        let i = 0;
         app.entries[i].open_in = Some(OpenIn::Current);
-        // These tests run against whatever you have configured, and a tile with
-        // folders asks which one first -- a path with its own test. Destination
-        // resolution is what this is about, so take the question away.
-        app.entries[i].folders.clear();
         let vis = app.visible();
         app.sel = vis.iter().position(|&e| e == i).unwrap();
         let argv = app.entries[i].argv.clone();
+        let label = app.entries[i].label().to_string();
+        // Loading the config may have had something to say; what this is about
+        // is what *activating* says.
+        app.status = None;
         app.activate(&vis);
         assert!(app.quit, "must leave the TUI");
         assert_eq!(app.handoff.as_deref(), Some(argv.as_slice()));
         assert!(app.status.is_none(), "handoff should not report a spawned tab");
+        // The tab we are handing over has to be renamed, or it keeps the name
+        // of whatever opened the home screen.
+        let title = app.handoff_title.expect("a taken-over tab is still a tab");
+        assert!(title.ends_with(&label), "the tile names the tab: {title}");
     }
 
     /// A one-off key beats the tile's own setting, which beats the global.
@@ -459,22 +551,17 @@ mod tests {
     #[test]
     fn the_destination_is_resolved_most_specific_first() {
         use config::OpenIn;
-        let pick = |a: &App| a.entries.iter().position(|e| !e.hidden());
+        let pick = |a: &App| (!a.entries.is_empty()).then_some(0);
 
         let mut app = App::new();
         let Some(i) = pick(&app) else { return };
         let vis = app.visible();
         let sel = vis.iter().position(|&e| e == i).unwrap();
 
-        // A tile with folders asks which one before it launches, which is a
-        // different question from where it launches.
-        let no_folders = |a: &mut App| a.entries[i].folders.clear();
-
         // Global says tab, tile says current: the tile wins, so this hands off.
         app.sel = sel;
         app.open_in = OpenIn::Tab;
         app.entries[i].open_in = Some(OpenIn::Current);
-        no_folders(&mut app);
         app.activate(&vis);
         assert!(app.handoff.is_some(), "tile setting beats the global");
 
@@ -483,7 +570,6 @@ mod tests {
         app.sel = sel;
         app.open_in = OpenIn::Current;
         app.entries[i].open_in = None;
-        no_folders(&mut app);
         app.activate(&vis);
         assert!(app.handoff.is_some(), "global applies when the tile is silent");
 
@@ -492,7 +578,6 @@ mod tests {
         app.sel = sel;
         app.open_in = OpenIn::Tab;
         app.entries[i].open_in = Some(OpenIn::Tab);
-        no_folders(&mut app);
         app.activate_in(&vis, Some(OpenIn::Current));
         assert!(app.handoff.is_some(), "the one-off key wins");
     }
@@ -507,18 +592,16 @@ mod tests {
         use launch::Backend;
         let mut app = App::new();
         app.backend = Backend::InPlace;
-        let Some(i) = app.entries.iter().position(|e| !e.hidden() && !e.argv.is_empty()) else {
+        let Some(i) = app.entries.iter().position(|e| !e.argv.is_empty()) else {
             return;
         };
-        // A tile with folders asks which one first, which is a different
-        // question from where it opens.
-        app.entries[i].folders.clear();
         app.entries[i].open_in = Some(OpenIn::Window);
         let vis = app.visible();
         app.sel = vis.iter().position(|&x| x == i).unwrap();
         let argv = app.entries[i].argv.clone();
 
         // Both the tile's own setting and a one-off `t` ask for a new surface.
+        app.status = None;
         app.activate_in(&vis, Some(OpenIn::Tab));
         assert!(app.quit, "must leave the TUI rather than report a failure");
         assert_eq!(app.handoff.as_deref(), Some(argv.as_slice()));
@@ -572,60 +655,99 @@ mod tests {
         }
     }
 
-    /// `d` only offers to undo something that exists. A plain ~/.ssh/config
-    /// host has no block of ours, so there is nothing to remove.
+    /// `d` is one verb on every tile now: a host from ~/.ssh/config has no
+    /// block of ours to remove, but it is still deletable -- that is the whole
+    /// change, and it must not fall back to the old "nothing to remove".
     #[test]
-    fn delete_declines_when_there_is_no_customisation() {
+    fn delete_offers_itself_on_a_plain_ssh_config_host() {
         use entry::Origin;
         let mut app = App::new();
         if !select(&mut app, |e| e.origin() == Some(Origin::Ssh)) {
             return;
         }
+        app.status = None;
         press(&mut app, ratatui::crossterm::event::KeyCode::Char('d'));
-        assert!(matches!(app.mode, Mode::Browse), "no dialog for a no-op");
-        assert!(app.status.as_ref().is_some_and(|s| !s.good), "must say why");
+        assert!(matches!(app.mode, Mode::ConfirmDelete(_)), "must ask, not decline");
+        assert!(app.status.is_none(), "and say nothing until it is answered");
+
+        // n keeps it, and takes the dialog away.
+        press(&mut app, ratatui::crossterm::event::KeyCode::Char('n'));
+        assert!(matches!(app.mode, Mode::Browse));
     }
 
-    /// A hidden host leaves the screen but not the config, and `s` is the way
-    /// back to it.
-    /// Counts come from the live config rather than being assumed, since these
-    /// tests run against whatever the user actually has configured.
+    /// A filter is the only thing that takes a tile off the grid now, and the
+    /// clamp has to count what is left rather than the whole list.
     #[test]
-    fn hidden_hosts_drop_out_of_view_until_revealed() {
+    fn filtering_clamps_the_selection_to_what_is_visible() {
+        let mut app = App::new();
+        if app.visible().is_empty() {
+            return;
+        }
+        app.sel = app.visible().len() - 1;
+        app.filter = "zzzz-matches-nothing".into();
+        app.clamp_selection();
+        let vis = app.visible();
+        assert!(vis.is_empty(), "nothing matches that");
+        assert_eq!(app.sel, 0, "the cursor cannot be left past the end");
+    }
+
+    /// The two ways off the screen are not the same way. A hidden tile is still
+    /// a tile -- it leaves the grid, keeps its place in `entries`, and one key
+    /// brings every one of them back. A deleted tile was never built.
+    #[test]
+    fn hiding_takes_a_tile_off_the_grid_and_x_shows_it_again() {
         let mut app = App::new();
         app.show_hidden = false;
         let total = app.entries.len();
-        let Some(i) = app.entries.iter().position(|e| !e.is_local() && !e.hidden()) else {
-            return;
-        };
+        // Counted rather than assumed: this runs against whatever the machine
+        // actually has configured, which may already hide some of it.
+        let Some(shown) = app.entries.iter().position(|e| !e.hidden()) else { return };
         let before = app.visible().len();
 
-        // Simulate what `x` writes, without touching the real config file.
-        app.entries[i].hidden = true;
-        assert_eq!(app.visible().len(), before - 1, "hidden host leaves the grid");
-        assert_eq!(app.entries.len(), total, "but stays in the list");
+        // What `x` writes, without touching the real config file.
+        app.entries[shown].hidden = true;
+        assert_eq!(app.visible().len(), before - 1, "it leaves the grid");
+        assert_eq!(app.entries.len(), total, "but not the board");
 
-        app.show_hidden = true;
-        assert_eq!(app.visible().len(), total, "revealed again by the setting");
+        press(&mut app, ratatui::crossterm::event::KeyCode::Char('X'));
+        assert!(app.show_hidden, "X reveals");
+        assert_eq!(app.visible().len(), total, "all of them, in their own places");
+        assert!(app.status.as_ref().is_some_and(|s| s.good), "and says what it did");
+
+        press(&mut app, ratatui::crossterm::event::KeyCode::Char('X'));
+        assert!(!app.show_hidden, "and puts them back");
+        assert_eq!(app.visible().len(), before - 1);
     }
 
-    /// Hiding the selected last tile must not leave the cursor past the end.
-    /// The clamp has to count visible tiles, not all of them.
+    /// Revealing is a look, not an edit: `X` must not write to config.toml, so
+    /// a reload -- which every write does -- must not undo the look either.
+    #[test]
+    fn revealing_survives_a_reload_and_writes_nothing() {
+        let mut app = App::new();
+        let before = std::fs::read(config::path()).ok();
+        app.show_hidden = false;
+        press(&mut app, ratatui::crossterm::event::KeyCode::Char('X'));
+        assert!(app.show_hidden);
+        app.reload();
+        assert!(app.show_hidden, "a reload must not put the hidden tiles back");
+        assert_eq!(std::fs::read(config::path()).ok(), before, "the file is untouched");
+    }
+
+    /// Hiding the selected last tile must not leave the cursor past the end:
+    /// the clamp has to count visible tiles, not all of them.
     #[test]
     fn hiding_clamps_the_selection_to_what_is_visible() {
         let mut app = App::new();
+        if app.visible().is_empty() {
+            return;
+        }
         app.sel = app.visible().len() - 1;
         for e in app.entries.iter_mut() {
             e.hidden = true;
         }
         app.clamp_selection();
         let vis = app.visible();
-        assert!(
-            vis.is_empty() || app.sel < vis.len(),
-            "sel {} past the {} visible tiles",
-            app.sel,
-            vis.len()
-        );
+        assert!(vis.is_empty() || app.sel < vis.len(), "sel {} of {}", app.sel, vis.len());
     }
 
     /// Local tiles are editable now, with their own field set rather than the
@@ -668,19 +790,27 @@ mod tests {
         assert_eq!(keys, ui::LOCAL_FIELDS);
     }
 
-    /// The whole block, not just the grid, is centred in both axes.
+    /// The board is centred in both axes -- in what is left of the screen once
+    /// the footer has taken the bottom edge, since the keys are a fixed
+    /// reference rather than part of the board.
     #[test]
-    fn content_is_centred() {
+    fn content_is_centred_above_a_footer_on_the_bottom_edge() {
         use ratatui::crossterm::event::KeyCode;
         let _ = KeyCode::Enter;
         for (w, h) in [(160u16, 50u16), (120, 40), (100, 30)] {
             let (app, out) = frame(w, h, |_| {});
             let rows: Vec<&str> = out.lines().collect();
             let ink = |r: &str| r.trim_matches('"').trim_end().len() > 0;
-            let top = rows.iter().position(|r| ink(r)).unwrap();
-            let bottom = rows.len() - 1 - rows.iter().rev().position(|r| ink(r)).unwrap();
+
+            // The keys are on the last row that is not the status line, however
+            // few tiles there are to sit above them.
+            assert!(ink(rows[rows.len() - 2]), "{w}x{h}: no keys on the bottom edge");
+
+            let board = &rows[..rows.len() - 2];
+            let top = board.iter().position(|r| ink(r)).unwrap();
+            let bottom = board.len() - 1 - board.iter().rev().position(|r| ink(r)).unwrap();
             let above = top;
-            let below = rows.len() - 1 - bottom;
+            let below = board.len() - 1 - bottom;
             assert!(
                 above.abs_diff(below) <= 2,
                 "{w}x{h}: {above} rows above vs {below} below"
@@ -963,6 +1093,44 @@ mod tests {
         assert_eq!(app.sections, App::new().sections, "nothing was written");
     }
 
+    /// Two tiles for one host are the same host: where each of them lands is the
+    /// whole of the difference, so the folder has to be on the tile. The command
+    /// deliberately is not -- one short line per tile, spent on the destination.
+    #[test]
+    fn a_tile_says_where_it_lands_and_not_what_it_runs() {
+        if App::new().visible().len() < 2 {
+            return;
+        }
+        let (_, out) = frame(120, 30, |a| {
+            let vis = a.visible();
+            a.entries[vis[0]].folder = Some("~/thesis".into());
+            a.entries[vis[1]].command = Some("tmux attach".into());
+        });
+        assert!(out.contains("~/thesis"), "the folder is on the tile");
+        assert!(!out.contains("tmux attach"), "the command is not");
+    }
+
+    /// Both kinds of tile have a folder and a command now, and switching between
+    /// them mid-form must not throw away what has been typed into either.
+    #[test]
+    fn folder_and_command_belong_to_both_kinds_of_tile() {
+        use config::Block;
+        use ratatui::crossterm::event::KeyCode;
+        assert!(ui::HOST_FIELDS.contains(&"folder") && ui::HOST_FIELDS.contains(&"command"));
+        assert!(ui::LOCAL_FIELDS.contains(&"folder") && ui::LOCAL_FIELDS.contains(&"command"));
+
+        let mut app = App::new();
+        let mut form = Form::new(Block::Host);
+        form.set("folder", "~/thesis");
+        form.set("command", "tmux attach");
+        app.mode = Mode::Add(form);
+        press(&mut app, KeyCode::Right);
+        let Mode::Add(f) = &app.mode else { panic!("left the form") };
+        assert_eq!(f.block, Block::Local, "the kind row switched");
+        assert_eq!(f.field("folder"), "~/thesis", "carried across");
+        assert_eq!(f.field("command"), "tmux attach");
+    }
+
     #[test]
     fn a_bad_hex_is_rejected_without_writing() {
         use ui::ColorChoice;
@@ -979,3 +1147,4 @@ mod tests {
         assert!(!app.entries.iter().any(|e| e.label() == "probe-host"), "nothing written");
     }
 }
+

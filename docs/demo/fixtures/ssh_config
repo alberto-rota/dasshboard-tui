@@ -1,0 +1,25 @@
+# A made-up ~/.ssh/config, for the README's recordings only.
+# Nothing here resolves: the domains are RFC 2606 examples.
+
+Host orion
+    HostName orion.hpc.example.edu
+    User a3417291
+    ProxyJump gateway
+
+Host gateway
+    HostName gateway.hpc.example.edu
+    User a3417291
+
+Host builder
+    HostName builder.eu-west.example.net
+    User ubuntu
+    IdentityFile ~/.ssh/id_builder
+
+Host nas
+    HostName 10.0.0.12
+    User admin
+    Port 2222
+
+Host pi-garden
+    HostName pi-garden.lan
+    User pi

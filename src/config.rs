@@ -1,7 +1,7 @@
 //! User config at `~/.config/dasshboard/config.toml`.
 //!
-//! Written by hand, or from the UI: `a` adds, `e` edits, `d` deletes, `s`
-//! toggles options. Every UI edit rewrites whole blocks as *text* rather than
+//! Written by hand, or from the UI: `a` adds, `e` edits, `y` duplicates, `d`
+//! deletes, `s` toggles options. Every UI edit rewrites whole blocks as *text* rather than
 //! re-serialising the document, so comments and hand-formatting survive -- a
 //! round trip of add, edit and delete leaves the file byte-identical.
 
@@ -73,10 +73,13 @@ pub struct Options {
     /// Tint the spawned Ghostty tab's background with the host's colour.
     #[serde(default = "yes")]
     pub tint_tabs: bool,
-    /// Prefix the Ghostty tab title with the host's coloured circle.
+    /// Prefix the tab title with the host's coloured circle.
     #[serde(default = "yes")]
     pub tab_emoji: bool,
-    /// Reveal hosts marked `hidden`, so they can be unhidden again.
+    /// Whether hidden tiles are on screen when the home screen opens. `X`
+    /// flips it for the session; this is only the state it starts in, which is
+    /// why nothing writes it back -- revealing hidden tiles is a look, not a
+    /// setting, and a peek should not change the file.
     #[serde(default)]
     pub show_hidden: bool,
     /// Default destination for a tile that doesn't name its own.
@@ -118,16 +121,34 @@ pub struct HostEntry {
     pub jump: Option<String>,
     /// `"#rrggbb"`. Omitted means a stable colour picked from the palette.
     pub color: Option<String>,
-    /// Keep this host off the home screen. Useful for a bastion you only ever
-    /// jump through and never open a shell on.
+    /// Off the home screen until you ask for it. For the host you keep but
+    /// rarely open -- a bastion you jump through, a box you touch twice a year.
+    /// It is still a tile, still in its group, still one keystroke from being
+    /// back; `X` shows every hidden tile and `x` puts this one back.
     #[serde(default)]
     pub hidden: bool,
+    /// This tile was deleted. Only ever written for a host that comes from
+    /// `~/.ssh/config`: that file is ssh's and is never rewritten, so the only
+    /// place we can record the deletion is here. The host itself is untouched
+    /// and still works as a `ProxyJump` target -- only the tile is gone.
+    ///
+    /// Unlike `hidden`, this is not a state a tile can be in and come back from
+    /// on the board: nothing draws it, nothing counts it, and `a` with the same
+    /// name is what undoes it.
+    #[serde(default)]
+    pub deleted: bool,
     /// Overrides `[options] open_in` for this host.
     pub open_in: Option<OpenIn>,
-    /// Directories to offer on connect. More than one turns activating the
-    /// tile into a small picker.
-    #[serde(default)]
-    pub folders: Vec<String>,
+    /// The one directory this tile starts in. Absent is the default: wherever a
+    /// login shell lands, which is home.
+    pub folder: Option<String>,
+    /// What to run there, on the far side. Absent is the default: a login shell.
+    pub command: Option<String>,
+    /// The old `folders = [...]`, read so a config written before tiles had one
+    /// folder each still loads. The first becomes `folder`; `y` on a tile is how
+    /// you get the rest back.
+    #[serde(default, rename = "folders")]
+    pub legacy_folders: Vec<String>,
 }
 
 /// Which array-of-tables a draft belongs to.
@@ -168,15 +189,32 @@ pub struct Draft {
     pub jump: String,
     pub command: String,
     pub detail: String,
-    pub folders: Vec<String>,
+    /// One directory, or empty for the default.
+    pub folder: String,
     pub color: String,
+    /// Off the screen until `X`. Kept through every other edit, which is what
+    /// stops `e` on a hidden tile from quietly bringing it back.
     pub hidden: bool,
+    /// Written as `deleted = true`, and only for a host from `~/.ssh/config`:
+    /// every other tile is a block of ours, and deleting one takes the block.
+    pub deleted: bool,
     pub open_in: Option<OpenIn>,
 }
 
 impl Draft {
     pub fn host(name: &str) -> Self {
         Self { block: Block::Host, name: name.to_string(), ..Default::default() }
+    }
+
+    /// Nothing but the name and the flag: deleting a host from `~/.ssh/config`
+    /// must not pin its connection details on the way out.
+    pub fn deleted_host(name: &str) -> Self {
+        Self { deleted: true, ..Draft::host(name) }
+    }
+
+    /// The same tile under a new name -- what `y` writes.
+    pub fn renamed(&self, name: &str) -> Self {
+        Self { name: name.to_string(), ..self.clone() }
     }
 }
 
@@ -189,9 +227,11 @@ impl From<&HostEntry> for Draft {
             user: h.user.clone().unwrap_or_default(),
             port: h.port.map(|p| p.to_string()).unwrap_or_default(),
             jump: h.jump.clone().unwrap_or_default(),
-            folders: h.folders.clone(),
+            command: h.command.clone().unwrap_or_default(),
+            folder: h.folder.clone().unwrap_or_default(),
             color: h.color.clone().unwrap_or_default(),
             hidden: h.hidden,
+            deleted: h.deleted,
             open_in: h.open_in,
             ..Default::default()
         }
@@ -203,11 +243,12 @@ impl From<&LocalEntry> for Draft {
         Self {
             block: Block::Local,
             name: l.label.clone(),
-            command: l.command.clone(),
+            command: l.command.clone().unwrap_or_default(),
             detail: l.detail.clone(),
-            folders: l.folders.clone(),
+            folder: l.folder.clone().unwrap_or_default(),
             color: l.color.clone().unwrap_or_default(),
             hidden: l.hidden,
+            deleted: l.deleted,
             open_in: l.open_in,
             ..Default::default()
         }
@@ -220,14 +261,23 @@ pub struct LocalEntry {
     pub label: String,
     #[serde(default)]
     pub detail: String,
-    pub command: String,
+    /// Absent is the default: this machine's login shell.
+    pub command: Option<String>,
     pub color: Option<String>,
+    /// See `HostEntry::hidden`.
     #[serde(default)]
     pub hidden: bool,
-    pub open_in: Option<OpenIn>,
-    /// Directories to start the command in.
+    /// See `HostEntry::deleted`. A local tile is only ever ours, so `d` takes
+    /// its block out entirely and this is never written -- it is read only so
+    /// that a hand-written `deleted = true` does what it says.
     #[serde(default)]
-    pub folders: Vec<String>,
+    pub deleted: bool,
+    pub open_in: Option<OpenIn>,
+    /// The one directory the command starts in. Absent means home.
+    pub folder: Option<String>,
+    /// See `HostEntry::legacy_folders`.
+    #[serde(default, rename = "folders")]
+    pub legacy_folders: Vec<String>,
 }
 
 /// A `[[section]]` block: a titled group of tiles, in the order they appear on
@@ -326,9 +376,9 @@ pub fn step(layout: &mut [SectionEntry], label: &str, forward: bool) -> bool {
 /// Where a tile sits as far as the screen is concerned: its group, and its
 /// position among the tiles of that group you can actually see.
 ///
-/// Stepping is defined over the whole layout, hidden tiles included, but a step
-/// onto a hidden neighbour looks like nothing happened -- so the mover repeats
-/// until *this* changes.
+/// Stepping is defined over the whole layout, hidden and filtered-out tiles
+/// included, but a step onto one of those looks like nothing happened -- so the
+/// mover repeats until *this* changes.
 pub fn shown_position(
     layout: &[SectionEntry],
     label: &str,
@@ -413,11 +463,37 @@ pub fn load() -> (Config, Option<String>) {
         Err(e) => return (Config::default(), Some(format!("could not read config: {e}"))),
     };
     match toml::from_str::<Config>(&text) {
-        Ok(cfg) => (cfg, None),
+        Ok(mut cfg) => {
+            fold_legacy_folders(&mut cfg);
+            (cfg, None)
+        }
         Err(e) => {
             let msg = e.message().lines().next().unwrap_or("invalid TOML").to_string();
             (Config::default(), Some(format!("config.toml: {msg}")))
         }
+    }
+}
+
+/// Take the old `folders = [...]` down to the one folder a tile has now.
+///
+/// A tile is one place and one command, so a list of them cannot be honoured any
+/// more -- but a config that has one must still come up. The first is kept,
+/// because it is the one that used to be offered first, and the rest are
+/// dropped without comment: the status line is for something that has just
+/// happened, and this has been true of the file since the day it was written.
+/// `y` is how you get a second tile for a folder you miss.
+fn fold_legacy_folders(cfg: &mut Config) {
+    let fold = |folder: &mut Option<String>, legacy: &mut Vec<String>| {
+        let mut old = std::mem::take(legacy).into_iter();
+        if folder.is_none() {
+            *folder = old.next();
+        }
+    };
+    for h in &mut cfg.hosts {
+        fold(&mut h.folder, &mut h.legacy_folders);
+    }
+    for l in &mut cfg.locals {
+        fold(&mut l.folder, &mut l.legacy_folders);
     }
 }
 
@@ -431,7 +507,7 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          #\n\
          # Tiles on your home screen, shown alongside the hosts read from\n\
          # ~/.ssh/config. Everything here is editable from the UI -- `a` add,\n\
-         # `e` edit, `d` delete, `x` hide, `s` settings -- or by hand.\n\
+         # `e` edit, `y` duplicate, `d` delete, `s` settings -- or by hand.\n\
          \n\
          [options]\n\
          # Set to false to show only the hosts defined below.\n\
@@ -442,6 +518,8 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          open_in = \"tab\"\n\
          # Prefix the tab title with the host's coloured circle.\n\
          tab_emoji = true\n\
+         # Open with hidden tiles already on screen. X toggles them either way.\n\
+         show_hidden = false\n\
          \n",
     );
 
@@ -449,15 +527,29 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
     // one, because that is what used to open with a terminal, and a plain login
     // shell where there is not. `current` either way: a local command takes
     // over this tab rather than opening another one.
+    // The command is written down only when it is not the default: a tile
+    // without one is already a login shell, and saying so twice would put a path
+    // on the tile that tells you nothing you cannot read off its label.
     let (detail, command) = match workspace_manager() {
-        Some((name, path)) => (format!("{name} · workspace manager"), path.display().to_string()),
-        None => ("local shell".to_string(), platform::login_shell()),
+        Some((name, path)) => (
+            format!("{name} · workspace manager"),
+            format!("command = {:?}\n", path.display().to_string()),
+        ),
+        None => ("local shell".to_string(), String::new()),
     };
     s.push_str(&format!(
         "# Local tiles run a command on this machine. `open_in` decides where:\n\
          # a new tab, a new window, or \"current\" to take over this one.\n\
          # Outside Ghostty on macOS every tile opens in the current terminal.\n\
-         [[local]]\nlabel = {:?}\ndetail = {detail:?}\ncommand = {command:?}\n\
+         #\n\
+         # `command` defaults to your login shell and `folder` to your home\n\
+         # directory. One of each per tile: press y on a tile to duplicate it\n\
+         # and point the copy somewhere else.\n\
+         #\n\
+         # A command that is not something you sit in is fine: it runs, and\n\
+         # then a shell takes the session over in the same folder, so what it\n\
+         # printed is still on screen.\n\
+         [[local]]\nlabel = {:?}\ndetail = {detail:?}\n{command}\
          open_in = \"current\"\n\n",
         platform::machine_name(),
     ));
@@ -467,9 +559,21 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          # passed to ssh as-is, so anything ssh already resolves just works.\n\
          #\n\
          # `color` sets the tile dot and the tab tint. Leave it out and one is\n\
-         # picked from the palette by name, the same on every run. `hidden`\n\
-         # keeps a host off the screen -- handy for a jump host you never open\n\
-         # a shell on. Turn on show_hidden to see and unhide them.\n\
+         # picked from the palette by name, the same on every run.\n\
+         #\n\
+         # Two ways off the screen, and they mean different things. `x` hides a\n\
+         # tile -- for the host you keep but rarely open -- and `X` shows every\n\
+         # hidden one again, so it is one keystroke away rather than gone.\n\
+         # `d` deletes. For a host that comes from ~/.ssh/config there is no\n\
+         # block to remove -- that file is never written to -- so the tile is\n\
+         # struck off with `deleted = true` instead. The host keeps working as a\n\
+         # ProxyJump target either way; only the tile goes. Delete that line, or\n\
+         # press `a` and give the same name, to get it back.\n\
+         #\n\
+         # `folder` is the one directory the session starts in, and `command`\n\
+         # what runs there -- a login shell in your home directory if neither\n\
+         # is given. Both are on the far side for an ssh host, and so is the\n\
+         # login shell that takes over when the command ends.\n\
          #\n\
          # [[host]]\n\
          # name = \"myserver\"\n\
@@ -477,6 +581,8 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          # user = \"albe\"\n\
          # port = 22\n\
          # jump = \"bastion\"\n\
+         # folder = \"/srv/app\"\n\
+         # command = \"tmux attach\"\n\
          # color = \"#4f8ab0\"\n\
          # hidden = false\n\
          # open_in = \"window\"\n\
@@ -520,6 +626,36 @@ fn save_block_at(path: &Path, original: Option<&str>, d: &Draft) -> std::io::Res
     append_block_at(path, d).map(|()| false)
 }
 
+/// Write a new block directly below the block named `after`, falling back to the
+/// end of the file when that one has no block of its own.
+///
+/// Where a block sits is where its tile is drawn, as long as no `[[section]]`
+/// says otherwise -- so a duplicate belongs next to the tile it copies, in the
+/// file as much as on screen.
+pub fn insert_block_after(after: &str, d: &Draft) -> std::io::Result<()> {
+    insert_block_after_at(&path(), after, d)
+}
+
+fn insert_block_after_at(path: &Path, after: &str, d: &Draft) -> std::io::Result<()> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    let Some((_, end)) = find_block(&lines, d.block, after) else {
+        return append_block_at(path, d);
+    };
+
+    let mut out: Vec<String> = lines[..end].iter().map(|s| s.to_string()).collect();
+    if !out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.push(String::new());
+    }
+    out.push(d.block.header().to_string());
+    out.extend(block_body(d).lines().map(String::from));
+    if end < lines.len() {
+        out.push(String::new());
+    }
+    out.extend(lines[end..].iter().map(|s| s.to_string()));
+    write_lines(path, out)
+}
+
 fn append_block_at(path: &Path, d: &Draft) -> std::io::Result<()> {
     let mut text = fs::read_to_string(path).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {
@@ -542,9 +678,16 @@ fn block_body(d: &Draft) -> String {
             ("hostname", &d.hostname),
             ("user", &d.user),
             ("jump", &d.jump),
+            ("command", &d.command),
+            ("folder", &d.folder),
             ("color", &d.color),
         ],
-        Block::Local => &[("command", &d.command), ("detail", &d.detail), ("color", &d.color)],
+        Block::Local => &[
+            ("command", &d.command),
+            ("detail", &d.detail),
+            ("folder", &d.folder),
+            ("color", &d.color),
+        ],
     };
     for (key, value) in pairs {
         if !value.trim().is_empty() {
@@ -556,18 +699,11 @@ fn block_body(d: &Draft) -> String {
             s.push_str(&format!("port = {p}\n"));
         }
     }
-    let folders: Vec<String> = d
-        .folders
-        .iter()
-        .map(|f| f.trim())
-        .filter(|f| !f.is_empty())
-        .map(|f| format!("{f:?}"))
-        .collect();
-    if !folders.is_empty() {
-        s.push_str(&format!("folders = [{}]\n", folders.join(", ")));
-    }
     if d.hidden {
         s.push_str("hidden = true\n");
+    }
+    if d.deleted {
+        s.push_str("deleted = true\n");
     }
     if let Some(o) = d.open_in {
         s.push_str(&format!("open_in = {:?}\n", o.label()));
@@ -841,7 +977,7 @@ mod tests {
             port: "2222".into(),
             jump: "bastion".into(),
             color: "#4f8ab0".into(),
-            hidden: false,
+            deleted: false,
             open_in: None,
             ..Default::default()
         };
@@ -868,38 +1004,77 @@ mod tests {
         assert_eq!(fs::read_to_string(&p).unwrap(), SEED, "back to byte-identical");
     }
 
-    /// Hiding a host that has no block yet must create one, and hiding is the
-    /// only thing that block should say.
+    /// Deleting a host that lives in ~/.ssh/config leaves a block saying only
+    /// that: the file it comes from is not ours to edit, and a deletion that
+    /// pinned its connection details would resurrect them on the way back.
     #[test]
-    fn hiding_a_bare_ssh_config_host_writes_a_minimal_block() {
-        let p = scratch("hide", SEED);
-        let mut d = draft("csnhr");
-        d.hidden = true;
+    fn deleting_a_bare_ssh_config_host_writes_a_minimal_block() {
+        let p = scratch("delete-ssh", SEED);
+        let d = Draft::deleted_host("csnhr");
         assert!(!save_block_at(&p, Some("csnhr"), &d).unwrap(), "no block existed, so appended");
 
         let cfg = parse(&p);
         let h = cfg.hosts.iter().find(|h| h.name == "csnhr").unwrap();
-        assert!(h.hidden);
-        assert_eq!(h.hostname, None, "hiding must not pin the connection details");
+        assert!(h.deleted);
+        assert_eq!(h.hostname, None, "deleting must not pin the connection details");
         assert_eq!(h.user, None);
         assert_eq!(h.color, None);
 
-        // And unhiding takes the block back out to nothing but the name.
-        d.hidden = false;
-        assert!(save_block_at(&p, Some("csnhr"), &d).unwrap(), "now updates in place");
+        // Adding it back writes the same block without the flag.
+        assert!(save_block_at(&p, Some("csnhr"), &draft("csnhr")).unwrap(), "updates in place");
         let text = fs::read_to_string(&p).unwrap();
-        assert!(!text.contains("hidden"), "the flag is dropped, not written false");
+        assert!(!text.contains("deleted"), "the flag is dropped, not written false");
     }
 
+    /// A host whose block was customised loses that block's contents when it is
+    /// deleted -- it is a deletion, not a hiding -- but the rest of the file is
+    /// untouched and the block keeps its position.
     #[test]
-    fn hiding_preserves_the_rest_of_an_existing_block() {
+    fn deleting_a_customised_host_strips_its_block_to_the_flag() {
+        let p = scratch("delete-custom", SEED);
+        let mut d = draft("srv");
+        d.color = "#4f8ab0".into();
+        d.user = "albe".into();
+        save_block_at(&p, None, &d).unwrap();
+
+        save_block_at(&p, Some("srv"), &Draft::deleted_host("srv")).unwrap();
+
+        let h = parse(&p).hosts.into_iter().find(|h| h.name == "srv").unwrap();
+        assert!(h.deleted);
+        assert_eq!(h.color, None, "the customisation goes with the tile");
+        assert_eq!(h.user, None);
+        assert!(fs::read_to_string(&p).unwrap().contains("# a comment someone wrote"));
+    }
+
+    /// Two flags, two meanings, and neither may be read as the other: `hidden`
+    /// is a tile you can bring back with one key, `deleted` is one that is gone.
+    #[test]
+    fn hidden_and_deleted_are_separate_flags() {
+        let p = scratch("flags", SEED);
+        fs::write(
+            &p,
+            "[[host]]\nname = \"csnhr\"\nhidden = true\n\n\
+             [[host]]\nname = \"gone\"\ndeleted = true\n\n\
+             [[local]]\nlabel = \"box\"\nhidden = true\n",
+        )
+        .unwrap();
+        let cfg = parse(&p);
+        assert!(cfg.hosts[0].hidden && !cfg.hosts[0].deleted);
+        assert!(cfg.hosts[1].deleted && !cfg.hosts[1].hidden);
+        assert!(cfg.locals[0].hidden && !cfg.locals[0].deleted);
+    }
+
+    /// What `x` does: reload the block, flip one bit, write it back. Everything
+    /// else about the tile has to survive, or hiding would be a way of losing
+    /// the colour you picked.
+    #[test]
+    fn hiding_preserves_the_rest_of_the_block() {
         let p = scratch("hide-keep", SEED);
         let mut d = draft("srv");
         d.color = "#4f8ab0".into();
         d.user = "albe".into();
         save_block_at(&p, None, &d).unwrap();
 
-        // What the `x` key does: reload the block, flip one bit, write it back.
         let existing = parse(&p).hosts.into_iter().find(|h| h.name == "srv").unwrap();
         let mut back = Draft::from(&existing);
         back.hidden = true;
@@ -907,8 +1082,13 @@ mod tests {
 
         let h = parse(&p).hosts.into_iter().find(|h| h.name == "srv").unwrap();
         assert!(h.hidden);
-        assert_eq!(h.color.as_deref(), Some("#4f8ab0"), "colour survives hiding");
+        assert_eq!(h.color.as_deref(), Some("#4f8ab0"), "the colour survives hiding");
         assert_eq!(h.user.as_deref(), Some("albe"));
+
+        // And unhiding drops the key rather than writing it false.
+        back.hidden = false;
+        save_block_at(&p, Some("srv"), &back).unwrap();
+        assert!(!fs::read_to_string(&p).unwrap().contains("hidden"));
     }
 
     #[test]
@@ -955,10 +1135,10 @@ mod tests {
     fn toggling_an_option_rewrites_it_and_adds_a_missing_one() {
         let p = scratch("options", SEED);
         set_kv_at(&p, "options", "include_ssh_config", "false").unwrap();
-        set_kv_at(&p, "options", "show_hidden", "true").unwrap();
+        set_kv_at(&p, "options", "tab_emoji", "false").unwrap();
         let cfg = parse(&p);
         assert!(!cfg.options.include_ssh_config, "existing key rewritten");
-        assert!(cfg.options.show_hidden, "absent key added");
+        assert!(!cfg.options.tab_emoji, "absent key added");
         assert!(cfg.options.tint_tabs, "untouched key keeps its default");
         let text = fs::read_to_string(&p).unwrap();
         assert_eq!(text.matches("include_ssh_config").count(), 1, "written once");
@@ -996,22 +1176,22 @@ mod tests {
 
     /// Local tiles go through the same writer, into their own array.
     #[test]
-    fn a_local_block_round_trips_with_its_folders() {
+    fn a_local_block_round_trips_with_its_folder() {
         let p = scratch("local", SEED);
         let d = Draft {
             block: Block::Local,
             name: "MACBOOK".into(),
             command: "/bin/zsh".into(),
             detail: "local shell".into(),
-            folders: vec!["~/code/one".into(), "~/code/two".into()],
+            folder: "~/code/one".into(),
             ..Default::default()
         };
         assert!(!save_block_at(&p, None, &d).unwrap());
 
         let cfg = parse(&p);
         let l = cfg.locals.iter().find(|l| l.label == "MACBOOK").unwrap();
-        assert_eq!(l.command, "/bin/zsh");
-        assert_eq!(l.folders, ["~/code/one", "~/code/two"]);
+        assert_eq!(l.command.as_deref(), Some("/bin/zsh"));
+        assert_eq!(l.folder.as_deref(), Some("~/code/one"));
 
         // The seeded [[local]] must be untouched, and removal must find the
         // right one of the two.
@@ -1020,18 +1200,88 @@ mod tests {
         assert_eq!(parse(&p).locals.len(), 1);
     }
 
+    /// One folder and one command per tile, both optional: absent means home and
+    /// a login shell, which is what a bare `ssh host` already gives you.
     #[test]
-    fn folders_round_trip_on_a_host() {
-        let p = scratch("folders", SEED);
+    fn a_folder_and_a_command_round_trip_on_a_host() {
+        let p = scratch("folder", SEED);
         let mut d = draft("srv");
-        d.folders = vec!["/srv/app".into(), "/var/log".into()];
+        d.folder = "/srv/app".into();
+        d.command = "tmux attach".into();
         save_block_at(&p, None, &d).unwrap();
-        assert_eq!(parse(&p).hosts[0].folders, ["/srv/app", "/var/log"]);
+        let h = &parse(&p).hosts[0];
+        assert_eq!(h.folder.as_deref(), Some("/srv/app"));
+        assert_eq!(h.command.as_deref(), Some("tmux attach"));
 
-        // Clearing them drops the key rather than writing an empty array.
-        d.folders.clear();
+        // Clearing them drops the keys rather than writing them blank.
+        d.folder.clear();
+        d.command.clear();
         save_block_at(&p, Some("srv"), &d).unwrap();
-        assert!(!fs::read_to_string(&p).unwrap().contains("folders"));
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("folder") && !text.contains("command = \"\""));
+        assert_eq!(parse(&p).hosts[0].folder, None);
+    }
+
+    /// A config written when a tile could hold a list of folders must still come
+    /// up, quietly. The first is kept -- it is the one that used to be offered
+    /// first -- and the rest go without a word: nothing has just happened, the
+    /// file has said this all along.
+    #[test]
+    fn the_old_folders_list_folds_down_to_one() {
+        let p = scratch("legacy", SEED);
+        fs::write(
+            &p,
+            "[[host]]\nname = \"zima\"\nfolders = [\"~\", \"~/services\"]\n\n\
+             [[host]]\nname = \"solo\"\nfolders = [\"/srv\"]\n\n\
+             [[local]]\nlabel = \"box\"\ncommand = \"/bin/zsh\"\nfolders = [\"~/Desktop\"]\n",
+        )
+        .unwrap();
+        let mut cfg = parse(&p);
+        fold_legacy_folders(&mut cfg);
+
+        assert_eq!(cfg.hosts[0].folder.as_deref(), Some("~"));
+        assert_eq!(cfg.hosts[1].folder.as_deref(), Some("/srv"));
+        assert_eq!(cfg.locals[0].folder.as_deref(), Some("~/Desktop"));
+        assert!(cfg.hosts.iter().all(|h| h.legacy_folders.is_empty()), "read once, not twice");
+    }
+
+    /// The one thing loading a config is allowed to say is that it could not be
+    /// read. An old `folders = [...]` is not that: it parses, it comes up, and
+    /// a status line about it on every single start is noise.
+    #[test]
+    fn loading_an_old_config_says_nothing() {
+        let p = scratch("legacy-quiet", SEED);
+        fs::write(&p, "[[host]]\nname = \"zima\"\nfolders = [\"~\", \"~/services\"]\n").unwrap();
+        let mut cfg = parse(&p);
+        fold_legacy_folders(&mut cfg);
+        assert_eq!(cfg.hosts[0].folder.as_deref(), Some("~"), "still folded, just quietly");
+    }
+
+    /// A duplicate belongs next to what it copies -- in the file, which is the
+    /// screen order until a `[[section]]` says otherwise.
+    #[test]
+    fn an_inserted_block_lands_below_the_one_it_copies() {
+        let p = scratch("insert", SEED);
+        for n in ["one", "two"] {
+            save_block_at(&p, None, &draft(n)).unwrap();
+        }
+        let mut copy = draft("one-2");
+        copy.folder = "/srv/app".into();
+        insert_block_after_at(&p, "one", &copy).unwrap();
+
+        let names: Vec<String> = parse(&p).hosts.into_iter().map(|h| h.name).collect();
+        assert_eq!(names, ["one", "one-2", "two"], "beside it, not at the end");
+        // The file is still the file: nothing else moved, nothing was lost.
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# a comment someone wrote"));
+        assert!(text.contains("[[local]]"));
+        assert_eq!(parse(&p).hosts[1].folder.as_deref(), Some("/srv/app"));
+
+        // A tile with no block of its own -- a bare ~/.ssh/config host -- has
+        // nowhere to be inserted below, so the copy goes at the end.
+        insert_block_after_at(&p, "nobody", &draft("ghost")).unwrap();
+        let names: Vec<String> = parse(&p).hosts.into_iter().map(|h| h.name).collect();
+        assert_eq!(names, ["one", "one-2", "two", "ghost"]);
     }
 
     /// A host and a local may share a name without colliding, because the

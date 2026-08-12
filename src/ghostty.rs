@@ -65,6 +65,12 @@ fn scale_hex(hex: &str, factor: f32) -> Option<String> {
 /// `args` is already-split argv, and each element is quoted separately, so a
 /// value containing a space stays one argument instead of two.
 ///
+/// `shell_after` is the one case that does *not* hand the process over. A tile
+/// running a command of its own may be running one that exits -- `echo hi` is a
+/// tab that prints a line and then cannot be typed in -- so the command is run
+/// rather than exec'd, and the shell that follows it is what gets the surface.
+/// `sh` staying on as its parent is the price of there being something after it.
+///
 /// The tint is two OSC sequences the surface emits about itself: OSC 11 sets
 /// the background (scaled right down, or the text would be unreadable) and OSC
 /// 12 the cursor (full strength -- it is small enough to carry real colour).
@@ -75,6 +81,7 @@ fn surface_command(
     args: &[String],
     cwd: Option<&str>,
     tint: Option<&str>,
+    shell_after: bool,
 ) -> String {
     let argv: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
 
@@ -104,7 +111,19 @@ fn surface_command(
     if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
         inner.push_str(&format!("cd {} || exit 1; ", shell_quote(dir)));
     }
-    inner.push_str(&format!("exec {}", argv.join(" ")));
+    let run = argv.join(" ");
+    if shell_after {
+        // Exported for the shell alone, after the command has had the surface:
+        // it is about what may autostart in a *new* shell, and the command is
+        // not one. See `launch::NO_WORKSPACE_VAR`.
+        inner.push_str(&format!(
+            "{run}; export {}=1; exec {}",
+            crate::launch::NO_WORKSPACE_VAR,
+            shell_quote(&crate::platform::login_shell())
+        ));
+    } else {
+        inner.push_str(&format!("exec {run}"));
+    }
     format!("/bin/sh -c {}", shell_quote(&inner))
 }
 
@@ -123,11 +142,11 @@ pub fn open(
     cwd: Option<&str>,
     tint: Option<&str>,
     emoji: Option<&str>,
+    shell_after: bool,
 ) -> Result<String, String> {
-    let title = match emoji {
-        Some(e) => format!("{e} {label}"),
-        None => label.to_string(),
-    };
+    // The same title a handed-over tab gets, so a session reads the same in the
+    // tab bar wherever it landed.
+    let title = crate::launch::tab_title(label, emoji);
     // A new tab still needs a window to live in, so with none open we make one
     // either way.
     let make = if where_to == OpenIn::Window {
@@ -148,7 +167,7 @@ pub fn open(
          environment variables:{{{guard}}}}}\n\
          {make}\n\
          end tell",
-        cmd = applescript_quote(&surface_command(&title, argv, cwd, tint)),
+        cmd = applescript_quote(&surface_command(&title, argv, cwd, tint, shell_after)),
         guard = applescript_quote(&format!("{SKIP_VAR}=1")),
     ))
 }
@@ -179,6 +198,12 @@ fn run_applescript(script: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// The common case: the session *is* its command, so the command is exec'd
+    /// and nothing follows it. `shell_after` is covered on its own below.
+    fn surface(title: &str, args: &[String], cwd: Option<&str>, tint: Option<&str>) -> String {
+        surface_command(title, args, cwd, tint, false)
+    }
+
     fn argv(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -188,14 +213,14 @@ mod tests {
     #[test]
     fn the_whole_argv_round_trips() {
         assert_eq!(
-            surface_command("alex", &argv(&["ssh", "alex"]), None, None),
+            surface("alex", &argv(&["ssh", "alex"]), None, None),
             r#"/bin/sh -c 'printf '\''\033]0;%s\007'\'' '\''alex'\''; exec '\''ssh'\'' '\''alex'\'''"#
         );
     }
 
     #[test]
     fn a_local_command_uses_the_same_path() {
-        let cmd = surface_command("MACBOOK-PRO", &argv(&["/bin/zsh", "-l"]), None, None);
+        let cmd = surface("MACBOOK-PRO", &argv(&["/bin/zsh", "-l"]), None, None);
         assert!(cmd.contains(r"exec '\''/bin/zsh'\'' '\''-l'\''"));
     }
 
@@ -206,14 +231,34 @@ mod tests {
     #[test]
     fn a_folder_becomes_a_cd_before_the_exec() {
         let cmd =
-            surface_command("MACBOOK-PRO", &argv(&["/bin/zsh"]), Some("/Users/albe/Desktop"), None);
+            surface("MACBOOK-PRO", &argv(&["/bin/zsh"]), Some("/Users/albe/Desktop"), None);
         assert!(cmd.find("cd ") < cmd.find("exec"), "cd has to come first: {cmd}");
         assert!(cmd.contains(r"cd '\''/Users/albe/Desktop'\'' || exit 1"), "got {cmd}");
         assert!(!cmd.contains('~'), "a tilde here would be taken literally: {cmd}");
         assert!(
-            !surface_command("m", &argv(&["/bin/zsh"]), None, None).contains("cd "),
+            !surface("m", &argv(&["/bin/zsh"]), None, None).contains("cd "),
             "no folder, no cd"
         );
+    }
+
+    /// A command that exits would leave a tab that cannot be typed in, so it is
+    /// run rather than exec'd and a shell takes the surface after it. The `sh`
+    /// left holding the tty is the point: there has to be something to run the
+    /// shell when the command is done.
+    #[test]
+    fn a_command_that_may_exit_is_followed_by_a_shell() {
+        let cmd = surface_command("MEDIA", &argv(&["echo", "hi"]), None, None, true);
+        assert!(cmd.contains(r"'\''echo'\'' '\''hi'\''; export NO_HSL=1; exec "), "got {cmd}");
+        assert!(cmd.contains(&crate::platform::login_shell()), "the shell follows it: {cmd}");
+        // ...and only there: the tile that *is* a shell is how you reach the
+        // workspace manager, so nothing may suppress it on that path.
+        let plain = surface_command("MACBOOK", &argv(&["/bin/zsh"]), None, None, false);
+        assert!(!plain.contains("NO_HSL"), "not on the shell tile: {plain}");
+        assert!(!cmd.contains(r"exec '\''echo"), "the command itself is not exec'd: {cmd}");
+        // ...and the folder still applies to both halves.
+        let with_dir =
+            surface_command("MEDIA", &argv(&["echo", "hi"]), Some("/srv/app"), None, true);
+        assert!(with_dir.find("cd ") < with_dir.find("echo"), "cd comes first: {with_dir}");
     }
 
     #[test]
@@ -221,7 +266,7 @@ mod tests {
         // Can't call open() in a test (it would spawn a tab), so check the same
         // composition the caller does.
         let title = format!("{} {}", "🔵", "alex");
-        let cmd = surface_command(&title, &argv(&["ssh", "alex"]), None, None);
+        let cmd = surface(&title, &argv(&["ssh", "alex"]), None, None);
         assert!(cmd.contains("🔵 alex"), "emoji reaches the title");
         assert!(cmd.contains(r"exec '\''ssh'\'' '\''alex'\''"), "ssh gets the bare alias");
         assert!(!cmd.contains("ssh '\\''🔵"), "emoji never reaches the command");
@@ -231,20 +276,20 @@ mod tests {
     fn quote_in_alias_stays_quoted() {
         // Not a realistic host name, but the escaping must not break out of the
         // single-quoted word if one ever appears.
-        let cmd = surface_command("we'ird", &argv(&["ssh", "we'ird"]), None, None);
+        let cmd = surface("we'ird", &argv(&["ssh", "we'ird"]), None, None);
         assert!(cmd.contains(r"'\''"));
         assert!(!cmd.contains("we'ird"));
     }
 
     #[test]
     fn each_arg_is_quoted_separately() {
-        let cmd = surface_command("srv", &argv(&["ssh", "-p", "2222", "albe@10.0.0.5"]), None, None);
+        let cmd = surface("srv", &argv(&["ssh", "-p", "2222", "albe@10.0.0.5"]), None, None);
         assert!(cmd.contains(r"'\''-p'\'' '\''2222'\'' '\''albe@10.0.0.5'\''"));
     }
 
     #[test]
     fn a_space_in_an_arg_does_not_split_it() {
-        let cmd = surface_command("odd", &argv(&["ssh", "a b"]), None, None);
+        let cmd = surface("odd", &argv(&["ssh", "a b"]), None, None);
         // One quoted word, not two: the space stays inside the quotes.
         assert!(cmd.contains(r"'\''a b'\''"));
     }
@@ -253,7 +298,7 @@ mod tests {
     fn background_is_scaled_down_but_the_cursor_is_not() {
         // 0x4f,0x8a,0xb0 * 0.13, rounded: 10, 18, 23.
         assert_eq!(scale_hex("#4f8ab0", 0.13), Some("#0a1217".to_string()));
-        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), None, Some("#4f8ab0"));
+        let cmd = surface("srv", &argv(&["ssh", "srv"]), None, Some("#4f8ab0"));
         assert!(cmd.contains("]11;"), "sets background");
         assert!(cmd.contains("0a1217"), "background is the darkened value");
         assert!(cmd.contains("]12;"), "sets cursor");
@@ -264,14 +309,14 @@ mod tests {
 
     #[test]
     fn no_tint_means_no_osc_beyond_the_title() {
-        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), None, None);
+        let cmd = surface("srv", &argv(&["ssh", "srv"]), None, None);
         assert!(!cmd.contains("]11;") && !cmd.contains("]12;"));
     }
 
     #[test]
     fn malformed_tint_is_dropped_not_emitted_raw() {
         assert_eq!(scale_hex("nope", 0.13), None);
-        let cmd = surface_command("srv", &argv(&["ssh", "srv"]), None, Some("nope"));
+        let cmd = surface("srv", &argv(&["ssh", "srv"]), None, Some("nope"));
         assert!(!cmd.contains("]11;"), "no background from unparseable hex");
     }
 

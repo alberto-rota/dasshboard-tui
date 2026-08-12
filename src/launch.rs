@@ -21,6 +21,17 @@ pub const SKIP_VAR: &str = "DASSHBOARD_SKIP";
 /// `inplace`. Anything else is ignored rather than fatal.
 pub const BACKEND_VAR: &str = "DASSHBOARD_BACKEND";
 
+/// `hsl-login.sh`'s documented escape hatch, set for the shell that takes over
+/// *after* a tile's command has ended -- and nowhere else.
+///
+/// That shell reads the same rc as any other, whose last act is to start the
+/// workspace manager in a shell dasshboard declined. Which is exactly right for
+/// the tile that *is* a shell -- that is how you still reach herdr -- and exactly
+/// wrong here: quitting a `command = "herdr"` tile would land in a shell that
+/// starts herdr again, on a loop. `SKIP_VAR` alone cannot say this, since it is
+/// about the home screen rather than about what else owns a new terminal.
+pub const NO_WORKSPACE_VAR: &str = "NO_HSL";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     /// macOS running under Ghostty: new tabs and windows over AppleScript,
@@ -88,6 +99,39 @@ pub fn backend() -> Backend {
     )
 }
 
+/// What a session's surface is called: the tile's name, behind its coloured
+/// circle when `tab_emoji` is on.
+///
+/// A tab title is text, so the circle is the only way a tile's colour can reach
+/// the tab bar itself. Control characters are dropped because the title reaches
+/// the terminal inside an OSC sequence, which a stray BEL or ESC would cut
+/// short -- and the names come from `~/.ssh/config`, which is not ours to
+/// vouch for.
+pub fn tab_title(label: &str, emoji: Option<&str>) -> String {
+    let clean: String = label.chars().filter(|c| !c.is_control()).collect();
+    match emoji {
+        Some(e) => format!("{e} {clean}"),
+        None => clean,
+    }
+}
+
+/// Rename the terminal we are already in, on the way out of it.
+///
+/// The other half of `tab_title`. A tab we *spawn* is named by the command
+/// Ghostty runs in it; a tab we hand over to a session has to be named here, or
+/// it keeps whatever the home screen was called -- so `c` used to leave you in
+/// a tab still labelled after the terminal that opened it.
+///
+/// OSC 0 is not a Ghostty feature: it is what every terminal has always
+/// understood by "set the title", which is why this lives in `launch` and not
+/// in `ghostty`. A terminal that ignores it is no worse off than before.
+pub fn rename_current_tab(title: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]0;{title}\x07");
+    let _ = out.flush();
+}
+
 /// Open `argv` somewhere that is not this terminal.
 ///
 /// Only ever reached for a destination `resolve` has already agreed to, so the
@@ -99,9 +143,12 @@ pub fn spawn(
     cwd: Option<&str>,
     tint: Option<&str>,
     emoji: Option<&str>,
+    shell_after: bool,
 ) -> Result<String, String> {
     match backend() {
-        Backend::Ghostty => crate::ghostty::open(where_to, label, argv, cwd, tint, emoji),
+        Backend::Ghostty => {
+            crate::ghostty::open(where_to, label, argv, cwd, tint, emoji, shell_after)
+        }
         Backend::InPlace => {
             Err("this terminal cannot open new tabs -- opens here instead".into())
         }
@@ -141,6 +188,17 @@ mod tests {
             Backend::Ghostty,
             "an unknown value falls through to detection, it does not disable it"
         );
+    }
+
+    /// One title for both destinations: a session should read the same in the
+    /// tab bar whether it opened a tab or took this one over.
+    #[test]
+    fn a_tab_title_is_the_circle_and_the_name() {
+        assert_eq!(tab_title("alex", Some("🔵")), "🔵 alex");
+        assert_eq!(tab_title("alex", None), "alex", "no circle, no space");
+        // The title travels inside an OSC sequence, which a control character
+        // would cut short -- and these names come out of ~/.ssh/config.
+        assert_eq!(tab_title("a\x07b\x1bc", Some("🔵")), "🔵 abc");
     }
 
     /// A config written on a Mac has to keep working when it lands on a Linux

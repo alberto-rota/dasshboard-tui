@@ -7,8 +7,10 @@ you add yourself — becomes a clickable tile. Activating one connects: under
 Ghostty on macOS that is a new tab tinted with the host's colour, and in every
 other terminal it takes over the one you are already in.
 
-The whole block is centred in both axes, and tiles keep a fixed width — a wide
-terminal gets whitespace, not vast tiles.
+The board is centred in both axes and tiles keep a fixed width — a wide terminal
+gets whitespace, not vast tiles. The keys sit on the bottom edge of the screen,
+where they stay put: they don't move up and down as tiles are added, hidden or
+filtered, because they aren't part of the board.
 
 ```
    ◆  DASSHBOARD                                                5 ssh · 1 local
@@ -19,11 +21,23 @@ terminal gets whitespace, not vast tiles.
    ┃    local shell                   ┃  │    v120bb18@alex.nhr.fau.de ⤳    │
    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ╰──────────────────────────────────╯
 
-   ⏎ open   t/w/c tab·win·here   / find   a add   e edit   m move   S groups
+
+
+   ⏎ open   t/w/c where   / find   a add   e edit   y dup   d delete   x/X hide
 ```
+
+![The board: moving between tiles, then opening one in this terminal](docs/board.gif)
+
+Arrows or `hjkl` move, `⏎` opens. The session takes the terminal over — the
+recording is made in a terminal that cannot open tabs for us, so every tile lands
+here — and quitting it drops you back in the shell that started the home screen.
 
 Tiles keep the order you put them in, and can be grouped under headings — `m`
 moves one, `S` manages the groups. See [Order and groups](#order-and-groups).
+
+*Every recording on this page is made with [vhs](https://github.com/charmbracelet/vhs)
+against a machine that doesn't exist: the hosts, folders and notes are invented,
+and `docs/demo/` holds the tapes and the fake `~/.ssh/config` behind them.*
 
 Two kinds of tile:
 
@@ -50,7 +64,8 @@ looking at the terminal it was started in.
 | ssh tiles and local tiles | ✅ | ✅ | ✅ |
 | open in **this terminal** | ✅ | ✅ | ✅ |
 | open in a **new tab / window** | ✅ tinted, titled | → this terminal | → this terminal |
-| tab tint + coloured circle | ✅ | — | — |
+| the tab takes the tile's name + circle | ✅ | ✅ | ✅ |
+| background tint on the new surface | ✅ | — | — |
 | `--startup on` | ✅ zsh, bash | ✅ zsh, bash | by hand, see below |
 
 **Level 1 — macOS running Ghostty ≥ 1.2.** Everything above. `t`/`w`/`c` pick a
@@ -59,7 +74,9 @@ a background tint and its circle in the tab title.
 
 **Level 2 — everywhere else.** Every tile opens in the terminal you launched
 dasshboard from, `ssh` replacing the home screen and returning you to your shell
-when it ends. Nothing is silently broken: `tab` and `window` still parse, still
+when it ends. That tab is still renamed after the tile — a title is an escape
+sequence rather than an automation interface, so it needs nothing of the
+terminal. Nothing is silently broken: `tab` and `window` still parse, still
 save, and still travel in a config.toml shared between machines — they simply
 resolve to `current` on a machine that cannot honour them, and the settings
 panel says so. The `t`/`w`/`c` hints disappear from the footer, since there is
@@ -106,6 +123,12 @@ panel the arrows cycle presets and typing takes a hex; a colour is written the
 moment it parses, so the UI restyles as you type and never flickers through a
 half-finished value.
 
+![The settings panel: dropping ~/.ssh/config, then recolouring the whole UI](docs/theme.gif)
+
+Each row is written through as you change it, so the file and the screen can
+never disagree — the recording drops `~/.ssh/config` from the board and puts it
+back, then takes the chrome from grey and red to one blue.
+
 Hosts carry a **third** colour that is theirs alone, shown as the dot on the
 tile. That palette deliberately excludes red — a host that owned red would be
 indistinguishable from the cursor — and its eight entries are desaturated to sit
@@ -116,10 +139,10 @@ free one, so no two tiles on screen share a colour. The trade-off is that a
 host's colour depends on what else is on screen: adding a host can shift a
 later one. Pin any host with `color = "#rrggbb"` and it never moves.
 
-**The palette is sized to the emoji, not the other way round.** A Ghostty tab
-title is text, so a coloured circle is the only way a host's colour can reach
-the tab bar itself — the background tint colours the surface, not the strip you
-actually scan. There are nine circle emoji and red is spoken for, which leaves
+**The palette is sized to the emoji, not the other way round.** A tab title is
+text, so a coloured circle is the only way a host's colour can reach the tab bar
+itself — the background tint colours the surface, not the strip you actually
+scan, and it is the one of the two that needs Ghostty. There are nine circle emoji and red is spoken for, which leaves
 eight, one per palette slot. A richer palette would give two hosts the same
 circle and defeat the point. A hand-written hex gets the nearest circle by RGB
 distance, so `color = "#2255cc"` still shows 🔵.
@@ -129,55 +152,119 @@ rather it didn't, pin that host to another colour.
 
 ## Keys
 
+One key, one job. They come in four groups — **open**, **move around**,
+**change the board**, **open a panel** — and no letter appears in two of them,
+in either case.
+
 | | |
 |---|---|
 | click / `⏎` / `space` | open the tile |
+| `t` / `w` / `c` | open in a new tab / new window / this terminal, once (Ghostty only; elsewhere all three mean `c`) |
 | `1`–`9` | open that numbered tile directly |
 | arrows / `hjkl` | move (`j`/`k` move by a row, so they respect the grid) |
 | `g` / `G` | first / last |
 | `/` | find by name, target, or jump host; `esc` clears |
-| `a` | add a host |
-| `e` | edit the selected host — including ones from `~/.ssh/config` |
-| `m` | grab the selected tile; the arrows then move *it*, `⏎` drops it |
-| `S` | groups — make, rename, reorder and delete the sections tiles sit in |
-| `x` | hide the selected host (or unhide it, with `show_hidden` on) |
-| `d` | delete a host, or revert an `~/.ssh/config` one (asks first) |
-| `t` / `w` / `c` | open in a new tab / new window / this terminal, once (Ghostty only; elsewhere all three mean `c`) |
+| `a` | add a tile |
+| `e` | edit the selected tile — including hosts from `~/.ssh/config` |
+| `y` | duplicate it, so the copy can start somewhere else |
+| `d` | delete it (asks first) |
+| `x` / `X` | hide it / show every hidden tile |
+| `m` | grab it; the arrows then move *it*, `⏎` drops it |
 | `s` | settings — whether it opens with a terminal, options, destination and both colours |
-| in the picker | `1`-`9` jump, `⏎` open, `esc` cancel |
+| `S` | groups — make, rename, reorder and delete the sections tiles sit in |
 | `r` | re-read both config files |
 | `q` / `esc` | quit into the shell underneath |
 
-## Folders
+`/` is a lens on the board rather than a jump to one tile: it matches the name,
+the target and the jump host, the headings count what is left, and the ones a
+filter empties drop out of the way.
 
-A tile can carry directories to start in. Give a host more than zero and
-activating it asks which:
+![Filtering the board by name and by target](docs/find.gif)
 
-```
-┏ open alex in ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃                                                ┃
-┃ ▌ 1 home              no cd                    ┃
-┃   2 atlas             /scratch/atlas           ┃
-┃   3 thesis            /home/v120bb18/thesis    ┃
-┃                                                ┃
-┃   ↑↓ move   1-9 jump   ⏎ open   esc cancel     ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-```
+Duplicating used to be `D`, and it is `y` now because `d` deletes any tile
+outright — the constructive verb should not be one shift key away from the
+destructive one. Where a shift pair *is* used, the two halves belong together:
+`x` puts one tile away, `X` shows everything that has been put away. That is the
+one thing `s` used to do as a side job — the way back to a hidden host was the
+settings panel, so `s` meant both "settings" and "how I get that host back". It
+is a key of its own now. See [Hiding and deleting](#hiding-and-deleting).
 
-`home` is always first, so a host with folders is never *forced* into one. A
-one-off destination survives the picker: `w` then `2` opens that folder in a new
-window.
+## Folders and commands
+
+A tile is **one** place and **one** thing to run. `folder` is where the session
+starts, `command` is what runs there, and leaving either out gives you the
+default: your home directory, and a login shell.
 
 ```toml
 [[host]]
 name = "alex"
-folders = ["/scratch/atlas", "/home/v120bb18/thesis"]
+folder = "/scratch/atlas"
 
 [[local]]
 label = "MACBOOK-PRO"
-command = "/bin/zsh"
-folders = ["~/dasshboard-tui", "~/dotfiles"]
+folder = "~/dasshboard-tui"
+command = "nvim"
 ```
+
+The **folder** shows up along the bottom edge of the tile, because two tiles for
+one host are the same host and where each of them lands is the difference you
+have to be able to see:
+
+```
+  ╭ 1 ───────────────────────────────╮  ╭ 2 ───────────────────────────────╮
+  │  ● alex                          │  │  ● alex-2                        │
+  │    v120bb18@alex.nhr.fau.de      │  │    v120bb18@alex.nhr.fau.de      │
+  ╰────────────────── /scratch/atlas ╯  ╰───────────────────────── ~/thesis ╯
+```
+
+The command is deliberately *not* there. A tile has room for one short line, and
+a destination is what a person scans a board for — an argv is longer, less
+distinguishing, and already in the file. `/` still matches it, so a duplicate you
+told apart by its command is still findable by it.
+
+### The session outlives the command
+
+A command need not be something you sit in. `cat today.md` prints three lines and
+exits, and a session that *was* that command would die on the output it just
+produced — a tab you cannot type in, or a home screen that blinked and came back.
+So the command runs and then a shell takes over, in the same folder:
+
+![Opening a tile whose command prints and exits, and landing in a shell there](docs/command.gif)
+
+A tile with no command of its own is already a shell, has nothing to outlive, and
+still `exec`s outright — no wrapper process, and quitting it falls straight
+through to the shell that launched the home screen. For an ssh tile the shell
+that follows is the far side's, inside the same remote command; for a local one it
+is `$SHELL` here, which is why `dasshboard` sits behind it until you leave.
+
+The shell that follows a command is a **plain** one: it carries `DASSHBOARD_SKIP`
+like every shell below a home screen, and `NO_HSL` as well. Nothing that opens
+with a new terminal opens in it — no second home screen, and no workspace manager
+either, because quitting a `command = "herdr"` tile into a shell that starts herdr
+again is a loop. The tile that *is* a shell is the one that still gets it, which
+is the whole point of [The local tile](#the-local-tile).
+
+### More than one folder is more than one tile
+
+There is no picker any more. A host you open in three directories is three
+tiles, and `y` is how you get them: it writes a copy of the selected tile —
+same connection, same colour, its own name — directly below the original in
+config.toml and beside it on screen. Then `e` says where the copy goes.
+
+![Adding a host, duplicating it, and pointing the copy somewhere else](docs/add.gif)
+
+`alex` duplicates to `alex-2`, and `alex-2` to `alex-3` rather than `alex-2-2`:
+a copy of a copy is another tile for the same host, not a nested one. A copy of
+a host that only exists in `~/.ssh/config` can't inherit by name any more — it
+has a different one — so the alias becomes its `hostname` and ssh does the same
+lookup it would have done.
+
+An older config's `folders = [...]` still loads, quietly: the first becomes
+`folder` and the rest are dropped. It says nothing about it, because nothing has
+just happened — the file has read that way since the day it was written, and a
+status line on every start is noise. `y` is what gets a missing one back.
+
+### How each kind gets there
 
 The two kinds get there differently, because one directory is on this machine
 and the other isn't:
@@ -189,6 +276,20 @@ and the other isn't:
   tty, without which the remote shell isn't interactive; the `exec $SHELL -l`
   leaves you in a login shell in that folder rather than a bare `sh`. The alias
   still leads, so `IdentityFile` and friends keep applying.
+
+A `command` of your own runs in place of that login shell, with the shell behind
+it — `ssh <alias> -t 'cd <dir> && { tmux attach; exec ${SHELL:-/bin/sh} -l; }'` —
+and is passed on as written, because it is a line for the remote shell and the
+ones that are more than a program name wouldn't survive being second-guessed. The
+braces are what keep the pair together: without them the `&&` would reach past
+the group and a folder that isn't there would still open a shell, somewhere else.
+
+A **local** `command` is split into argv on spaces, with quotes for the arguments
+that contain them, and is never re-parsed by a shell — what runs is exactly what
+you configured. Taking over this terminal, dasshboard runs it and then execs the
+shell itself, with nothing in between; in a spawned tab the `sh` that already
+carries the title runs both, each argv element quoted separately so a space in one
+of them stays a space.
 
 Paths are quoted for the shell that will read them, local or remote — and `~`
 is handled on whichever side owns the home directory it means. A **local** one
@@ -222,6 +323,8 @@ tagged `moving` — and the arrows then move the tile instead of the cursor:
 
   ←→ reorder   ↑↓ by a row   g/G to an end   ⏎ drop
 ```
+
+![Moving a tile between groups, then making a group and moving one into it](docs/groups.gif)
 
 `←`/`→` move it one place, `↑`/`↓` a row's worth, `g`/`G` to one end. There is
 no separate "move to the next group" key because there doesn't need to be one:
@@ -278,9 +381,9 @@ Three consequences worth knowing:
   palette slot of a stranger three tiles away.
 
 A heading counts the tiles you can *see*, so it agrees with what is under it
-when a host is hidden or a filter is on. The mover counts the same way: a step
-that would land on a hidden tile keeps going, since stopping there would look
-like a dead key. A filter is a temporary lens rather than a rearrangement, so
+when a tile is hidden or a filter is on. The mover counts the same way: a step
+that would land on a tile you can't see keeps going, since stopping there would
+look like a dead key. A filter is a temporary lens rather than a rearrangement, so
 while one is active the groups it empties drop their headings instead of standing
 over nothing.
 
@@ -289,8 +392,10 @@ over nothing.
 Everything is editable without leaving the terminal UI — there is no `$EDITOR`
 handoff. `a` and `e` open the same form, whose first row picks what you are
 describing: an **ssh host** or a **local command**. The field set changes with
-it, since the two share almost nothing past the name. Only the name is required
-(plus `command` for a local); the rest falls back to ssh's own resolution. On the `color` row, `←`/`→` cycle `auto` and
+it, since the two share almost nothing past the name -- `folder` and `command`
+are the two rows both kinds carry, and switching kinds mid-form keeps them. Only
+the name is required; the rest falls back to a default, or to ssh's own
+resolution. On the `color` row, `←`/`→` cycle `auto` and
 the eight presets, or type a hex; the row previews the swatch and the exact
 circle the tab will carry. `s` opens settings and writes each toggle through
 immediately, so the file and the screen can never disagree.
@@ -313,7 +418,11 @@ on top of it:
 
 The name is the key joining the two files, so it's shown but locked, and focus
 skips it. Every blank field displays what it inherits and keeps tracking the ssh
-config; only what you actually fill in is written. So a colour override is just:
+config; only what you actually fill in is written:
+
+![Editing a host from ~/.ssh/config: inherited fields, a folder and a colour](docs/edit.gif)
+
+So a colour override is just:
 
 ```toml
 [[host]]
@@ -327,14 +436,21 @@ precedence over the config file without replacing the lookup — passing
 `user@host` instead would silently drop the alias's `IdentityFile`, `ForwardX11`
 and everything else.
 
-An override customises the existing tile rather than adding a second one, and
-`d` on such a host offers to **revert** it: the block goes, the tile stays.
+An override customises the existing tile rather than adding a second one. To
+drop the customisation and go back to tracking `~/.ssh/config`, clear the fields
+in `e` — blank is what "inherit" means, so the block empties out to nothing but
+the name.
 
-### Hiding a host
+### Hiding and deleting
 
-Not every `Host` in `~/.ssh/config` is somewhere you open a shell. A bastion
-that only exists to be jumped through is still a host ssh needs and a tile you
-never want. `x` hides the selected one:
+Not every `Host` in `~/.ssh/config` is somewhere you open a shell — and not
+every one you rarely open is one you want gone. Those are two different
+intentions, so they are two different keys.
+
+**`x` hides** the selected tile, and `X` shows every hidden one again. That is
+the soft one: it writes a single line into the block and keeps everything else —
+the colour, the folder, the place in its group — so a box you touch twice a year
+stops using up a tile without being a decision you have to redo.
 
 ```toml
 [[host]]
@@ -342,16 +458,51 @@ name = "csnhr"
 hidden = true
 ```
 
-That is the whole block — hiding pins nothing else, so the host keeps tracking
-`~/.ssh/config` and keeps working as a `ProxyJump` target for everything that
-routes through it. Only the tile goes.
+![Hiding a tile, revealing it, and deleting a host from ~/.ssh/config](docs/hide.gif)
 
-To get one back, turn on `show_hidden` in `s`: hidden hosts reappear dimmed and
-tagged `hidden`, and `x` puts them back. The form has the same toggle, so
-editing a hidden host can't silently unhide it.
+Revealed tiles come back dimmed and tagged `hidden`, which is what stops the two
+states looking alike, and `x` on one puts it back on the board for good.
+Revealing is a *look*, not a setting: `X` changes nothing on disk, so peeking
+costs no edit. `[options] show_hidden = true` decides what the board opens with,
+and `X` overrides it for the session. The form carries the same toggle, so `e`
+on a tile you have put away can't quietly bring it back.
 
-`--list` always prints hidden hosts, marked, since it exists to show you what is
-actually configured.
+**`d` deletes**, and what that means depends on where the tile came from:
+
+- a `[[host]]` or `[[local]]` **block of ours** — the block goes, and the file
+  comes back byte-identical to before it was added.
+- a host from **`~/.ssh/config`** — that file is ssh's and is never written to,
+  so there is no block to remove. The deletion is recorded in `config.toml`
+  instead:
+
+  ```toml
+  [[host]]
+  name = "csnhr"
+  deleted = true
+  ```
+
+That is the whole block. Unlike hiding, deleting keeps nothing — no colour, no
+hostname, no leftover customisation — but `~/.ssh/config` is still untouched, so
+the host keeps working as a `ProxyJump` target for everything that routes
+through it either way. Only the tile goes, and the confirm dialog says so.
+
+To get one back, delete that line by hand, or press `a` and give it the same
+name: saving a tile is what puts it on the board, so it rewrites the same block
+without the flag.
+
+**The difference is what the board does with it.** A hidden tile is a tile in a
+state: it is built, it holds its place in its group, it is counted in the
+header's `n of m shown`, `--list` prints it marked, and one keystroke brings it
+back. A deleted tile is none of those — it isn't built at all, so nothing counts
+it, nothing colours around it, and no key can reach it.
+
+| | `x` hide | `d` delete |
+|---|---|---|
+| in `config.toml` | `hidden = true` | block removed, or `deleted = true` |
+| the rest of the block | kept | gone |
+| on the board | `X` shows it, dimmed and tagged | not built |
+| asks first | no — it's reversible | yes |
+| way back | `x` on it again | `a` with the same name |
 
 Everything lands in `~/.config/dasshboard/config.toml` — `$XDG_CONFIG_HOME` if
 you set it, and `%APPDATA%\dasshboard\config.toml` on Windows — created with a
@@ -362,8 +513,8 @@ machine chose:
 [options]
 include_ssh_config = true   # false shows only the hosts defined here
 tint_tabs = true            # tint the new tab's background (Ghostty only)
-tab_emoji = true            # coloured circle in the tab title (Ghostty only)
-show_hidden = false         # reveal hidden hosts, to unhide them
+tab_emoji = true            # coloured circle in the tab title
+show_hidden = false         # open with hidden tiles on screen; X toggles them
 open_in = "tab"             # "tab", "window" or "current"; "current" elsewhere
 
 [theme]
@@ -373,7 +524,8 @@ accent = "#ff0000"
 [[local]]                   # a command on this machine
 label = "MACBOOK-PRO"
 detail = "local shell"
-command = "/bin/zsh"
+command = "/bin/zsh"        # optional: your login shell by default
+folder = "~/dasshboard-tui" # optional: home by default. one per tile -- y copies it
 
 [[host]]
 name = "myserver"
@@ -381,8 +533,10 @@ hostname = "10.0.0.5"
 user = "albe"
 port = 22
 jump = "bastion"
+folder = "/srv/app"         # optional: the far side's home by default
+command = "tmux attach"     # optional: a login shell by default
 color = "#4f8ab0"
-hidden = false
+hidden = false              # true keeps it off the board until X
 open_in = "window"          # overrides the global for this host
 
 [[section]]                 # a group, drawn in this order
@@ -393,9 +547,11 @@ items = ["myserver", "bastion"]
 Edits rewrite whole blocks **as text** rather than re-serialising the document,
 so your comments and formatting survive: `add_then_edit_then_delete_leaves_the_file_as_it_started`
 asserts the file comes back byte-identical, and editing a host keeps it in
-position rather than moving it to the end. `a`/`e`/`d` work on `[[host]]` and
-`[[local]]` blocks alike, keyed on `name` and `label` respectively — so a host
-and a local tile may share a name without colliding.
+position rather than moving it to the end. `y` inserts its copy directly below
+the block it came from rather than at the end, for the same reason: where a block
+sits is where its tile is drawn, until a `[[section]]` says otherwise. `a`/`e`/`d`
+work on `[[host]]` and `[[local]]` blocks alike, keyed on `name` and `label`
+respectively — so a host and a local tile may share a name without colliding.
 
 `[[section]]` is the one block rewritten wholesale, and the one the UI owns
 outright: it is a list of names in an order `m` shuffles, so there is no field to
@@ -423,6 +579,23 @@ wrapper process holding the tty, and when the connection ends the shell that
 launched dasshboard is what you land back in. Windows has no `exec`, so there
 the session runs as a child on the same console and dasshboard exits with its
 status — the only difference is a sleeping parent behind it.
+
+The one exception is a **local tile with a command of its own**, which may be a
+command that exits: there it is run and waited for, and then a shell is exec'd in
+the same folder, so the output has somewhere to be read. See [The session outlives
+the command](#the-session-outlives-the-command). That is the same shape Windows
+has always had, and the reason `hand_off` is two calls rather than one.
+
+In the gap between those two — after the TUI is gone, before the `exec` — the
+tab is renamed, `\033]0;🔵 alex\007`. A tab dasshboard *opens* is named by the
+command Ghostty runs in it; a tab it *takes over* would otherwise keep the name
+of whatever opened the home screen, so the one destination that works in every
+terminal was the one the tab bar couldn't tell you about. It is the same title
+the spawned tab gets, from the same `launch::tab_title`, so a session reads the
+same in the tab bar wherever it landed — and OSC 0 is what every terminal has
+always understood by "set the title", so this lives in `launch.rs` rather than
+`ghostty.rs`. The background tint stays with the spawned path only: it would
+outlive the session in a tab that was already yours.
 
 `DASSHBOARD_SKIP=1` is exported across the handoff. A local tile usually runs a
 shell, that shell reads the same rc that started dasshboard, and without the
@@ -457,6 +630,10 @@ argv element is quoted separately, so a value containing a space stays one
 argument to ssh. `exec` hands the process over so the tab dies with the
 connection, and `wait after command:true` keeps a failed connection on screen
 instead of flashing the tab shut.
+
+A local tile with a command of its own is the one that does not `exec`: it is
+`sh -c 'printf <title>; <cmd>; exec $SHELL'`, so `sh` is still there to start the
+shell when the command is done and the tab stays a tab you can type in.
 
 ## Config parsing
 
@@ -633,11 +810,29 @@ there.
 The binary is symlinked rather than copied, so `cargo build --release` takes
 effect immediately. Don't `cargo clean` without rebuilding.
 
+The recordings on this page are generated, not captured by hand:
+
+```sh
+./docs/demo/record.sh              # every docs/*.gif
+./docs/demo/record.sh find.tape    # just one
+```
+
+Each tape runs against a scratch `HOME` built from `docs/demo/fixtures/` — an
+invented `~/.ssh/config`, an invented `config.toml`, an rc with a two-word prompt
+— so a recording never reads or writes anything of yours, and the tapes that
+press `a`, `d`, `x` and `s` start from the same board every time. It needs `vhs`,
+`ffmpeg` and `ttyd`; vhs renders through a headless Chromium it fetches on first
+run, and `ROD_BROWSER_BIN` points it at one you already have.
+
 Layout is verified headlessly with ratatui's `TestBackend`, which is how the
 grid gets checked without a terminal: `every_tile_is_clickable_and_none_overlap`
-asserts the hitboxes cover the visible list and never overlap,
-`tiles_never_escape_the_viewport` runs the same check down to 30×10, and
-`content_is_centred` measures the whitespace on all four sides.
+asserts one hitbox per *drawn* tile — a board taller than the terminal scrolls,
+and what is below the fold has nowhere to be clicked — and that none of them
+overlap. `tiles_never_escape_the_viewport` runs the same check down to 30×10 and
+adds the footer's half of it: pinned to the bottom edge, it has to give that
+edge up rather than print the keys over a tile on a screen too short for both.
+`content_is_centred_above_a_footer_on_the_bottom_edge` measures the whitespace
+on all four sides of what is left once the footer has taken its row.
 
 The config writers take their target path as a parameter, so the round-trip
 tests run against a scratch file and never touch your real config.

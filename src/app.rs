@@ -21,12 +21,13 @@ pub enum Mode {
     Add(Form),
     Edit(Form),
     /// Index into `entries` of the tile awaiting a y/n.
+    ///
+    /// Every tile can answer it: a block of ours is removed, and a host from
+    /// `~/.ssh/config` -- which has no block of ours to remove -- is struck off
+    /// in config.toml instead, leaving that file alone.
     ConfirmDelete(usize),
     /// Focused row in the settings list, plus the colour text being typed.
     Settings { focus: usize, buf: String },
-    /// Choosing where to land. `force` carries a one-off destination through
-    /// the picker so `w` then a folder still opens a window.
-    Folders { entry: usize, sel: usize, force: Option<OpenIn> },
     /// The selected tile is grabbed, and the arrows move it rather than the
     /// cursor. Which tile that is stays in `sel`, as it does everywhere else --
     /// the cursor travels with the tile, so there is nothing extra to remember.
@@ -43,6 +44,23 @@ fn short_home(p: &std::path::Path) -> String {
         Some(h) if !h.is_empty() && s.starts_with(h) => format!("~{}", &s[h.len()..]),
         _ => s,
     }
+}
+
+/// `alex` -> `alex-2`, `alex-2` -> `alex-3`: the stem and the first free number,
+/// so duplicating a duplicate doesn't stack suffixes.
+///
+/// A name is what joins a tile to its block, to its place in a group and -- for a
+/// host from `~/.ssh/config` -- to that file, so a copy needs one of its own
+/// before anything can be written down.
+fn free_name(base: &str, taken: &[String]) -> String {
+    let stem = base
+        .rsplit_once('-')
+        .filter(|(s, n)| !s.is_empty() && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .map_or(base, |(s, _)| s);
+    (2..)
+        .map(|n| format!("{stem}-{n}"))
+        .find(|c| !taken.iter().any(|t| t == c))
+        .unwrap_or_else(|| base.to_string())
 }
 
 pub struct Status {
@@ -73,14 +91,24 @@ pub struct App {
     pub tile_rows: Vec<Vec<usize>>,
     pub cols: usize,
     pub quit: bool,
-    /// Set when a Local tile is chosen: exec'd after the terminal is restored,
-    /// so the command inherits this tab instead of opening a new one.
+    /// Set when a tile opens in this terminal: exec'd after the terminal is
+    /// restored, so the command inherits this tab instead of opening a new one.
     pub handoff: Option<Vec<String>>,
     /// Directory to chdir into before the handoff exec.
     pub handoff_cwd: Option<String>,
+    /// What this tab should be called once the session owns it. A tab we open
+    /// is titled by the command Ghostty runs in it; a tab we *take over* has to
+    /// be titled on the way out, or it keeps the name of the home screen.
+    pub handoff_title: Option<String>,
+    /// Whether a shell takes this terminal over when the handed-off command
+    /// ends, rather than the command being exec'd outright. See `Entry`.
+    pub handoff_shell_after: bool,
     pub include_ssh_config: bool,
     pub tint_tabs: bool,
     pub tab_emoji: bool,
+    /// Whether hidden tiles are on screen. A view, not a setting: `X` flips it
+    /// and nothing writes it back, so peeking at what you have put away costs
+    /// no edit to the file. `[options] show_hidden` decides where it starts.
     pub show_hidden: bool,
     pub open_in: OpenIn,
     pub theme: Theme,
@@ -90,6 +118,10 @@ pub struct App {
     /// What this terminal can do with a session. Read once: it is a property of
     /// the environment we were started in, which cannot change under us.
     pub backend: Backend,
+    /// Whether `[options] show_hidden` has been taken yet. It seeds the view
+    /// once and then `X` owns it: every write reloads the config, and a reload
+    /// must not put back the hidden tiles you have just asked to see.
+    first_load: bool,
 }
 
 impl App {
@@ -110,6 +142,8 @@ impl App {
             quit: false,
             handoff: None,
             handoff_cwd: None,
+            handoff_title: None,
+            handoff_shell_after: false,
             include_ssh_config: true,
             tint_tabs: true,
             tab_emoji: true,
@@ -118,6 +152,7 @@ impl App {
             theme: Theme::default(),
             startup: startup::State::Off,
             backend: launch::backend(),
+            first_load: true,
         };
         app.load(false);
         app
@@ -128,8 +163,10 @@ impl App {
         self.include_ssh_config = cfg.options.include_ssh_config;
         self.tint_tabs = cfg.options.tint_tabs;
         self.tab_emoji = cfg.options.tab_emoji;
-        self.show_hidden = cfg.options.show_hidden;
         self.open_in = cfg.options.open_in;
+        if std::mem::take(&mut self.first_load) {
+            self.show_hidden = cfg.options.show_hidden;
+        }
         self.theme = Theme::new(
             cfg.theme.primary.as_deref().unwrap_or(crate::theme::DEFAULT_PRIMARY),
             cfg.theme.accent.as_deref().unwrap_or(crate::theme::DEFAULT_ACCENT),
@@ -190,16 +227,12 @@ impl App {
                 on: self.tint_tabs,
                 note: inert,
             },
+            // Not marked inert: a tab we take over gets its title set on the way
+            // out, which is an escape sequence any terminal understands.
             SettingRow::Toggle {
                 key: "tab_emoji",
                 label: "coloured circle in the tab title",
                 on: self.tab_emoji,
-                note: inert,
-            },
-            SettingRow::Toggle {
-                key: "show_hidden",
-                label: "reveal hidden hosts",
-                on: self.show_hidden,
                 note: "",
             },
             SettingRow::Choice {
@@ -224,7 +257,8 @@ impl App {
         ]
     }
 
-    /// Indices into `entries` that pass the current filter.
+    /// Indices into `entries` that are on screen: not put away, or put away and
+    /// asked for.
     pub fn visible(&self) -> Vec<usize> {
         self.entries
             .iter()
@@ -271,68 +305,54 @@ impl App {
             self.say(format!("{} has no command to run", self.entries[ei].label), false);
             return;
         }
-        // With folders configured there is a choice to make, so ask rather than
-        // guessing which one you meant.
-        if !self.entries[ei].folders.is_empty() {
-            self.mode = Mode::Folders { entry: ei, sel: 0, force };
-            return;
-        }
-        self.launch(ei, None, force);
+        self.launch(ei, force);
     }
 
-    fn launch(&mut self, ei: usize, dir: Option<&str>, force: Option<OpenIn>) {
+    fn launch(&mut self, ei: usize, force: Option<OpenIn>) {
         let e = &self.entries[ei];
         // The tile asks; the terminal answers. Where new surfaces are not
         // available every destination collapses to "here", so a config written
         // on a Mac still opens the right host on a Linux or Windows box.
         let where_to = self.backend.resolve(force.or(e.open_in).unwrap_or(self.open_in));
         let label = e.label.clone();
-        let argv = e.argv_in(dir);
-        let cwd = e.local_cwd(dir);
+        let argv = e.argv.clone();
+        let cwd = e.cwd.clone();
+        // A command of its own may be one that exits, and the session has to
+        // outlive it wherever it landed.
+        let shell_after = e.shell_after;
         let tint = self.tint_tabs.then(|| e.tint.hex.clone());
         let emoji = self.tab_emoji.then_some(e.tint.emoji);
-        let where_text =
-            dir.map_or_else(|| where_to.label().to_string(), |d| format!("{} · {d}", where_to.label()));
+        // A tile is one place now, so where it lands is worth saying once it is
+        // somewhere other than the obvious one.
+        let where_text = match e.folder.as_deref() {
+            Some(d) => format!("{} · {d}", where_to.label()),
+            None => where_to.label().to_string(),
+        };
 
         if where_to == OpenIn::Current {
             // Handed to main() after the terminal is restored, so the command
-            // inherits a clean screen and this tab.
+            // inherits a clean screen and this tab -- including its name. The
+            // tab we are in was called whatever opened the home screen, and a
+            // session that took it over should read as itself in the tab bar,
+            // exactly as a spawned one does.
+            self.handoff_title = Some(launch::tab_title(&label, emoji));
             self.handoff = Some(argv);
             self.handoff_cwd = cwd;
+            self.handoff_shell_after = shell_after;
             self.quit = true;
             return;
         }
-        match launch::spawn(where_to, &label, &argv, cwd.as_deref(), tint.as_deref(), emoji) {
+        match launch::spawn(
+            where_to,
+            &label,
+            &argv,
+            cwd.as_deref(),
+            tint.as_deref(),
+            emoji,
+            shell_after,
+        ) {
             Ok(_) => self.say(format!("opened {where_text} — {label}"), true),
             Err(e) => self.say(e, false),
-        }
-    }
-
-    fn key_folders(&mut self, key: KeyEvent) {
-        let Mode::Folders { entry, sel, force } = self.mode else { return };
-        let n = self.entries[entry].folders.len() + 1;
-        match key.code {
-            KeyCode::Esc => self.mode = Mode::Browse,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.mode = Mode::Folders { entry, sel: (sel + n - 1) % n, force }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.mode = Mode::Folders { entry, sel: (sel + 1) % n, force }
-            }
-            KeyCode::Char(c @ '1'..='9') => {
-                let i = c as usize - '1' as usize;
-                if i < n {
-                    self.mode = Mode::Browse;
-                    let dir = (i > 0).then(|| self.entries[entry].folders[i - 1].clone());
-                    self.launch(entry, dir.as_deref(), force);
-                }
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                self.mode = Mode::Browse;
-                let dir = (sel > 0).then(|| self.entries[entry].folders[sel - 1].clone());
-                self.launch(entry, dir.as_deref(), force);
-            }
-            _ => {}
         }
     }
 
@@ -347,7 +367,6 @@ impl App {
             Mode::Add(_) | Mode::Edit(_) => self.key_form(key),
             Mode::ConfirmDelete(_) => self.key_confirm(key),
             Mode::Settings { .. } => self.key_settings(key),
-            Mode::Folders { .. } => self.key_folders(key),
             Mode::Move => self.key_move(key, vis),
             Mode::Sections { .. } => self.key_sections(key),
         }
@@ -381,6 +400,13 @@ impl App {
         }
     }
 
+    /// One key, one job. The letters are grouped by what they do -- open,
+    /// navigate, change the board, open a panel -- and no letter appears in two
+    /// of those groups. Where a shift pair *is* used it is because the two
+    /// halves belong together: `x` puts one tile away and `X` shows everything
+    /// that has been put away. That is also why duplicating is `y` and not `D`:
+    /// `d` deletes a tile outright, and the neighbouring shift key should not
+    /// be the one constructive verb on the board.
     fn key_browse(&mut self, key: KeyEvent, vis: &[usize]) {
         let last = vis.len().saturating_sub(1);
         match key.code {
@@ -392,11 +418,13 @@ impl App {
             }
             KeyCode::Char('a') => self.mode = Mode::Add(Form::new(Block::Host)),
             KeyCode::Char('e') => self.begin_edit(vis),
+            KeyCode::Char('y') => self.duplicate(vis),
             KeyCode::Char('d') => self.begin_delete(vis),
-            KeyCode::Char('s') => self.mode = Mode::Settings { focus: 0, buf: String::new() },
-            KeyCode::Char('m') => self.begin_move(vis),
-            KeyCode::Char('S') => self.mode = Mode::Sections { focus: 0, buf: None },
             KeyCode::Char('x') => self.toggle_hidden(vis),
+            KeyCode::Char('X') => self.toggle_show_hidden(),
+            KeyCode::Char('m') => self.begin_move(vis),
+            KeyCode::Char('s') => self.mode = Mode::Settings { focus: 0, buf: String::new() },
+            KeyCode::Char('S') => self.mode = Mode::Sections { focus: 0, buf: None },
             KeyCode::Char('r') => self.reload(),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(vis),
             KeyCode::Char('t') => self.activate_in(vis, Some(OpenIn::Tab)),
@@ -461,9 +489,9 @@ impl App {
             };
             let mut f = Form::new(Block::Local);
             f.set("label", &l.label);
-            f.set("command", &l.command);
+            f.set("command", l.command.clone().unwrap_or_default());
             f.set("detail", &l.detail);
-            f.set("folders", l.folders.join(", "));
+            f.set("folder", l.folder.clone().unwrap_or_default());
             f.color = ColorChoice::from_config(l.color.as_deref());
             f.hidden = l.hidden;
             f.open_in = l.open_in;
@@ -478,7 +506,8 @@ impl App {
             f.set("user", ov.and_then(|h| h.user.clone()).unwrap_or_default());
             f.set("port", ov.and_then(|h| h.port.map(|p| p.to_string())).unwrap_or_default());
             f.set("jump", ov.and_then(|h| h.jump.clone()).unwrap_or_default());
-            f.set("folders", ov.map(|h| h.folders.join(", ")).unwrap_or_default());
+            f.set("folder", ov.and_then(|h| h.folder.clone()).unwrap_or_default());
+            f.set("command", ov.and_then(|h| h.command.clone()).unwrap_or_default());
             f.set_placeholder("hostname", tile.defaults.hostname.clone());
             f.set_placeholder("user", tile.defaults.user.clone());
             f.set_placeholder("port", tile.defaults.port.clone());
@@ -576,8 +605,6 @@ impl App {
             Some("name cannot contain spaces".to_string())
         } else if clashes {
             Some(format!("{name} already exists"))
-        } else if block == Block::Local && form.field("command").trim().is_empty() {
-            Some("command is required".to_string())
         } else if !port.is_empty() && port.parse::<u16>().is_err() {
             Some("port must be a number".to_string())
         } else if !color.is_empty() && crate::entry::Tint::parse(&color).is_none() {
@@ -599,9 +626,15 @@ impl App {
             jump: form.field("jump").trim().into(),
             command: form.field("command").trim().into(),
             detail: form.field("detail").trim().into(),
-            folders: form.folder_list(),
+            folder: form.field("folder").trim().into(),
             color,
+            // Carried on the form rather than assumed, so `e` on a tile you
+            // have put away cannot quietly bring it back.
             hidden: form.hidden,
+            // Saving a tile is what puts it on the board, so it cannot also be
+            // saying the tile is gone -- and that is how `a` with the name of a
+            // deleted ~/.ssh/config host brings it back.
+            deleted: false,
             open_in: form.open_in,
         };
 
@@ -622,38 +655,111 @@ impl App {
         }
     }
 
-    /// Hide or reveal the selected tile, writing (or creating) its block. A
-    /// hidden host stays in ~/.ssh/config and still works as a ProxyJump -- it
-    /// just stops taking up a tile.
-    fn toggle_hidden(&mut self, vis: &[usize]) {
-        let Some(i) = self.selected_entry(vis) else { return };
+    /// The selected tile as a config.toml block describes it: its own block if
+    /// it has one, and for a bare ~/.ssh/config host the empty block a first
+    /// customisation would create. `None` once it has already said why not.
+    fn draft_for(&mut self, i: usize) -> Option<Draft> {
         let name = self.entries[i].label.clone();
         let (cfg, _) = config::load();
-        let mut draft = if self.entries[i].is_local() {
+        if self.entries[i].is_local() {
             match cfg.locals.iter().find(|l| l.label == name) {
-                Some(l) => Draft::from(l),
+                Some(l) => Some(Draft::from(l)),
                 None => {
                     self.say(format!("{name} is not in config.toml"), false);
-                    return;
+                    None
                 }
             }
         } else {
-            cfg.hosts
-                .iter()
-                .find(|h| h.name == name)
-                .map(Draft::from)
-                .unwrap_or_else(|| Draft::host(&name))
-        };
+            Some(
+                cfg.hosts
+                    .iter()
+                    .find(|h| h.name == name)
+                    .map(Draft::from)
+                    .unwrap_or_else(|| Draft::host(&name)),
+            )
+        }
+    }
+
+    /// A second tile for the same thing, free to start somewhere else.
+    ///
+    /// This is what one folder per tile costs and what pays for it: a host you
+    /// open in three directories is three tiles, each with its own name, colour
+    /// and destination, instead of one tile that stops to ask every time. The
+    /// copy is written directly below the original and placed beside it on
+    /// screen, so all that is left to do is `e` and say where it goes.
+    fn duplicate(&mut self, vis: &[usize]) {
+        let Some(i) = self.selected_entry(vis) else { return };
+        let original = self.entries[i].label.clone();
+        let Some(mut draft) = self.draft_for(i) else { return };
+        let taken: Vec<String> = self.entries.iter().map(|e| e.label.clone()).collect();
+        let name = free_name(&original, &taken);
+
+        // A copy of a host we only know from ~/.ssh/config cannot inherit by
+        // name any more -- it has a different one -- so the alias becomes its
+        // hostname and ssh does the same lookup it would have done.
+        if draft.block == Block::Host && draft.hostname.trim().is_empty() {
+            draft.hostname = original.clone();
+        }
+        let draft = draft.renamed(&name);
+
+        match config::insert_block_after(&original, &draft) {
+            Ok(()) => {
+                self.load(false);
+                self.place_beside(&original, &name);
+                self.focus_named(&name);
+                self.say(format!("duplicated {original} as {name} — e to point it somewhere"), true);
+            }
+            Err(e) => self.say(format!("write failed: {e}"), false),
+        }
+    }
+
+    /// Put a newly written tile next to the one it came from.
+    ///
+    /// Only worth doing once groups exist: with none, the arrangement is the
+    /// order of the blocks in the file, which is where it was just inserted --
+    /// and writing a `[[section]]` listing every tile to say so would be a lot
+    /// of file for no change on screen.
+    fn place_beside(&mut self, original: &str, name: &str) {
+        if self.sections.len() == 1 && self.sections[0].is_empty() {
+            return;
+        }
+        let mut layout = self.layout();
+        for s in layout.iter_mut() {
+            s.items.retain(|i| i != name);
+        }
+        let found = layout
+            .iter()
+            .enumerate()
+            .find_map(|(s, sec)| sec.items.iter().position(|i| i == original).map(|at| (s, at)));
+        let Some((s, at)) = found else { return };
+        layout[s].items.insert(at + 1, name.to_string());
+        self.write_layout(&layout, name);
+    }
+
+    /// Put the selected tile away, or take it back out: `x`.
+    ///
+    /// The soft half of the pair. Deleting takes a tile out of the config;
+    /// hiding writes one line into it and keeps everything else -- the colour,
+    /// the folder, the place in its group -- so a host you touch twice a year
+    /// stops using up a tile without being a decision you have to redo.
+    ///
+    /// A hidden `~/.ssh/config` host still resolves and still works as a
+    /// `ProxyJump` target, which is the case this exists for.
+    fn toggle_hidden(&mut self, vis: &[usize]) {
+        let Some(i) = self.selected_entry(vis) else { return };
+        let name = self.entries[i].label.clone();
+        let Some(mut draft) = self.draft_for(i) else { return };
         draft.hidden = !draft.hidden;
 
         match config::save_block(Some(&name), &draft) {
             Ok(_) => {
                 self.load(false);
                 self.focus_named(&name);
+                self.clamp_selection();
                 let msg = if draft.hidden {
-                    format!("hid {name} — s to reveal hidden")
+                    format!("hid {name} — X shows hidden tiles")
                 } else {
-                    format!("revealed {name}")
+                    format!("{name} is back on the board")
                 };
                 self.say(msg, true);
             }
@@ -661,39 +767,65 @@ impl App {
         }
     }
 
+    /// Show or stop showing every hidden tile: `X`.
+    ///
+    /// A view rather than a setting, so nothing is written down. Revealed tiles
+    /// are dimmed and tagged, which is what stops the two states looking alike.
+    fn toggle_show_hidden(&mut self) {
+        let n = self.entries.iter().filter(|e| e.hidden()).count();
+        self.show_hidden = !self.show_hidden;
+        self.clamp_selection();
+        let msg = match (self.show_hidden, n) {
+            (_, 0) => "nothing is hidden — x puts a tile away".to_string(),
+            (true, 1) => "showing 1 hidden tile — x puts one back".to_string(),
+            (true, n) => format!("showing {n} hidden tiles — x puts one back"),
+            (false, n) => format!("{n} hidden again"),
+        };
+        self.say(msg, true);
+    }
+
+    /// `d` on any tile. Every tile can be deleted -- there is no second, softer
+    /// verb for the ones we cannot take a block away from, because `x` is not a
+    /// weaker delete but a different intention.
     fn begin_delete(&mut self, vis: &[usize]) {
-        let Some(i) = self.selected_entry(vis) else { return };
-        if self.entries[i].has_own_block() || self.entries[i].is_local() {
+        if let Some(i) = self.selected_entry(vis) {
             self.mode = Mode::ConfirmDelete(i);
-        } else {
-            let name = &self.entries[i].label;
-            self.say(format!("{name} has no customisation to remove"), false);
         }
     }
 
     fn key_confirm(&mut self, key: KeyEvent) {
         let Mode::ConfirmDelete(i) = self.mode else { return };
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
-                let name = self.entries[i].label().to_string();
-                // Removing the block of an ~/.ssh/config host reverts it to
-                // whatever that file says; the tile itself stays.
-                let reverting = self.entries[i].origin() == Some(entry::Origin::SshOverridden);
-                let block =
-                    if self.entries[i].is_local() { Block::Local } else { Block::Host };
-                self.mode = Mode::Browse;
-                match config::remove_block(block, &name) {
-                    Ok(true) => {
-                        self.load(false);
-                        self.focus_named(&name);
-                        let what = if reverting { "reverted" } else { "deleted" };
-                        self.say(format!("{what} {name}"), true);
-                    }
-                    Ok(false) => self.say(format!("{name} not found in config.toml"), false),
-                    Err(e) => self.say(format!("write failed: {e}"), false),
-                }
+        if !matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+            self.mode = Mode::Browse;
+            return;
+        }
+
+        let name = self.entries[i].label().to_string();
+        self.mode = Mode::Browse;
+        // A tile that is a block of ours goes by having its block removed. A
+        // host that comes from ~/.ssh/config has no block to remove -- and that
+        // file is ssh's, never ours to rewrite -- so the deletion is recorded
+        // here instead, as a block that says only that the tile is gone.
+        let from_ssh = matches!(
+            self.entries[i].origin(),
+            Some(entry::Origin::Ssh | entry::Origin::SshOverridden)
+        );
+        let written = if from_ssh {
+            config::save_block(Some(&name), &config::Draft::deleted_host(&name)).map(|_| true)
+        } else {
+            let block = if self.entries[i].is_local() { Block::Local } else { Block::Host };
+            config::remove_block(block, &name)
+        };
+
+        match written {
+            Ok(true) => {
+                self.load(false);
+                self.clamp_selection();
+                let note = if from_ssh { " — ~/.ssh/config untouched" } else { "" };
+                self.say(format!("deleted {name}{note}"), true);
             }
-            _ => self.mode = Mode::Browse,
+            Ok(false) => self.say(format!("{name} not found in config.toml"), false),
+            Err(e) => self.say(format!("write failed: {e}"), false),
         }
     }
 
@@ -1105,5 +1237,26 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(1),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::free_name;
+
+    fn taken(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_copy_gets_the_next_free_number() {
+        assert_eq!(free_name("alex", &taken(&["alex"])), "alex-2");
+        assert_eq!(free_name("alex", &taken(&["alex", "alex-2"])), "alex-3");
+        // Copying a copy must not stack suffixes: it is another of the same
+        // host, not a copy of the copy.
+        assert_eq!(free_name("alex-2", &taken(&["alex", "alex-2"])), "alex-3");
+        assert_eq!(free_name("alex-2", &taken(&["alex", "alex-2", "alex-3"])), "alex-4");
+        // A dash that is not a number is part of the name.
+        assert_eq!(free_name("web-eu", &taken(&["web-eu"])), "web-eu-2");
     }
 }
