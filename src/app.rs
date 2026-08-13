@@ -404,9 +404,11 @@ impl App {
     /// navigate, change the board, open a panel -- and no letter appears in two
     /// of those groups. Where a shift pair *is* used it is because the two
     /// halves belong together: `x` puts one tile away and `X` shows everything
-    /// that has been put away. That is also why duplicating is `y` and not `D`:
-    /// `d` deletes a tile outright, and the neighbouring shift key should not
-    /// be the one constructive verb on the board.
+    /// that has been put away; `d` writes a second tile and `D` takes one away.
+    /// The initial goes to the verb you reach for daily, and the destructive
+    /// half is behind shift *and* behind the confirm dialog -- one of those two
+    /// alone would be thin, and `y` is not spare anyway, since it is what
+    /// answers that dialog.
     fn key_browse(&mut self, key: KeyEvent, vis: &[usize]) {
         let last = vis.len().saturating_sub(1);
         match key.code {
@@ -418,8 +420,8 @@ impl App {
             }
             KeyCode::Char('a') => self.mode = Mode::Add(Form::new(Block::Host)),
             KeyCode::Char('e') => self.begin_edit(vis),
-            KeyCode::Char('y') => self.duplicate(vis),
-            KeyCode::Char('d') => self.begin_delete(vis),
+            KeyCode::Char('d') => self.duplicate(vis),
+            KeyCode::Char('D') => self.begin_delete(vis),
             KeyCode::Char('x') => self.toggle_hidden(vis),
             KeyCode::Char('X') => self.toggle_show_hidden(),
             KeyCode::Char('m') => self.begin_move(vis),

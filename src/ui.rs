@@ -586,8 +586,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
                 ("/", "find"),
                 ("a", "add"),
                 ("e", "edit"),
-                ("y", "dup"),
-                ("d", "delete"),
+                ("d", "dup"),
+                ("D", "delete"),
                 ("x/X", "hide"),
                 ("m", "move"),
                 ("S", "groups"),
@@ -890,7 +890,7 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form, spawns: bool, th: &Theme) {
                 },
                 "hostname" => "defaults to name".into(),
                 "port" => "22".into(),
-                "folder" => "~  home — one per tile, y duplicates".into(),
+                "folder" => "~  home — one per tile, d duplicates".into(),
                 _ => "optional".into(),
             }
         };

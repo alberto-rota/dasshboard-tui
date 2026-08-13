@@ -23,7 +23,7 @@ Sleep 1500ms
 # deleting asks first, and says what it will write
 Type "G"
 Sleep 800ms
-Type "d"
+Type "D"
 Sleep 2500ms
 Type "y"
 Sleep 2500ms

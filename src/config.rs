@@ -1,6 +1,6 @@
 //! User config at `~/.config/dasshboard/config.toml`.
 //!
-//! Written by hand, or from the UI: `a` adds, `e` edits, `y` duplicates, `d`
+//! Written by hand, or from the UI: `a` adds, `e` edits, `d` duplicates, `D`
 //! deletes, `s` toggles options. Every UI edit rewrites whole blocks as *text* rather than
 //! re-serialising the document, so comments and hand-formatting survive -- a
 //! round trip of add, edit and delete leaves the file byte-identical.
@@ -507,7 +507,7 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          #\n\
          # Tiles on your home screen, shown alongside the hosts read from\n\
          # ~/.ssh/config. Everything here is editable from the UI -- `a` add,\n\
-         # `e` edit, `y` duplicate, `d` delete, `s` settings -- or by hand.\n\
+         # `e` edit, `d` duplicate, `D` delete, `s` settings -- or by hand.\n\
          \n\
          [options]\n\
          # Set to false to show only the hosts defined below.\n\
@@ -543,7 +543,7 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          # Outside Ghostty on macOS every tile opens in the current terminal.\n\
          #\n\
          # `command` defaults to your login shell and `folder` to your home\n\
-         # directory. One of each per tile: press y on a tile to duplicate it\n\
+         # directory. One of each per tile: press d on a tile to duplicate it\n\
          # and point the copy somewhere else.\n\
          #\n\
          # A command that is not something you sit in is fine: it runs, and\n\

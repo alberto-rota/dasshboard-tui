@@ -1,4 +1,4 @@
-# `a` adds a tile, `y` duplicates one so the copy can start somewhere else.
+# `a` adds a tile, `d` duplicates one so the copy can start somewhere else.
 
 Output "docs/add.gif"
 Source "docs/demo/_setup.tape"
@@ -40,7 +40,7 @@ Enter
 Sleep 2s
 
 # the copy is another tile for the same host, with its own folder
-Type "y"
+Type "d"
 Sleep 1800ms
 Type "e"
 Sleep 1s

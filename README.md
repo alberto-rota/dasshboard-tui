@@ -5,18 +5,6 @@
 A home screen for your terminal. Every host in `~/.ssh/config` — plus anything you
 add yourself — becomes a tile. Pick one and it connects.
 
-```
-   ◆  DASSHBOARD                                                5 ssh · 1 local
-   ━━━━━━━━━━━━━━──────────────────────────────────────────────────────────────
-
-   ┏ 1 ━━━━━━━━━━━━━━━━━━━━━━━━ local ┓  ╭ 2 ───────────────────────────────╮
-   ┃▌ ● MACBOOK-PRO                   ┃  │  ● alex                          │
-   ┃    local shell                   ┃  │    v120bb18@alex.nhr.fau.de ⤳    │
-   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ╰──────────────────────────────────╯
-
-   ⏎ open   t/w/c where   / find   a add   e edit   d dup   D delete   x/X hide
-```
-
 ![The board: moving between tiles, then opening one in this terminal](docs/board.gif)
 
 ## Install
@@ -116,6 +104,3 @@ cargo test                   # parsing, escaping, colour assignment, layout
 that knows Ghostty exists. Layout is checked headlessly with ratatui's
 `TestBackend`.
 
-**[docs/design.md](docs/design.md)** is the long version: why the keys are what
-they are, how colours are derived, how a session is handed off, and what the
-startup hook has to work around.

@@ -655,7 +655,7 @@ mod tests {
         }
     }
 
-    /// `d` is one verb on every tile now: a host from ~/.ssh/config has no
+    /// `D` is one verb on every tile now: a host from ~/.ssh/config has no
     /// block of ours to remove, but it is still deletable -- that is the whole
     /// change, and it must not fall back to the old "nothing to remove".
     #[test]
@@ -666,13 +666,37 @@ mod tests {
             return;
         }
         app.status = None;
-        press(&mut app, ratatui::crossterm::event::KeyCode::Char('d'));
+        press(&mut app, ratatui::crossterm::event::KeyCode::Char('D'));
         assert!(matches!(app.mode, Mode::ConfirmDelete(_)), "must ask, not decline");
         assert!(app.status.is_none(), "and say nothing until it is answered");
 
         // n keeps it, and takes the dialog away.
         press(&mut app, ratatui::crossterm::event::KeyCode::Char('n'));
         assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    /// `d` duplicates and `D` deletes, which puts the destructive half behind
+    /// shift. Pressing `d` must not open the confirm dialog it used to, and the
+    /// old duplicate key must be inert rather than quietly still bound -- `y` is
+    /// the confirm dialog's "yes" now and nothing else. Neither half is pressed
+    /// here: duplicating writes to config.toml, so this asserts the dispatch and
+    /// the footer that advertises it, and `delete_offers_itself_on_a_plain_ssh_
+    /// config_host` is what presses `D`.
+    #[test]
+    fn duplicate_is_d_and_delete_is_shift_d() {
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::new();
+        if app.visible().is_empty() {
+            return;
+        }
+        app.status = None;
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(app.mode, Mode::Browse), "y opens nothing on the board");
+        assert!(app.status.is_none(), "and writes nothing, so it says nothing");
+
+        let (_, out) = frame(120, 30, |_| {});
+        assert!(out.contains("d dup"), "the footer offers d for duplicate");
+        assert!(out.contains("D delete"), "and shift-d for delete");
     }
 
     /// A filter is the only thing that takes a tile off the grid now, and the
