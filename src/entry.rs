@@ -382,6 +382,29 @@ fn split_command(command: &str) -> Vec<String> {
     out
 }
 
+/// Swap `ssh` for `autossh`, so a dropped connection -- the laptop slept, the
+/// network changed -- gets ssh restarted instead of leaving a dead tile.
+///
+/// `-M 0` turns off autossh's own monitoring port, which needs the remote end
+/// to allow port forwarding; the `ServerAlive` pair is what notices the
+/// connection is gone without it, sleep being the case that matters most since
+/// a socket left dangling by it can otherwise sit quiet far longer than either
+/// side is willing to wait.
+pub(crate) fn use_autossh(argv: &mut Vec<String>) {
+    argv.splice(
+        0..1,
+        [
+            "autossh".to_string(),
+            "-M".to_string(),
+            "0".to_string(),
+            "-o".to_string(),
+            "ServerAliveInterval=15".to_string(),
+            "-o".to_string(),
+            "ServerAliveCountMax=3".to_string(),
+        ],
+    );
+}
+
 /// An `~/.ssh/config` host, with an optional config.toml block layered on top.
 ///
 /// The alias is always the last argument, so ssh re-reads the same file we did
@@ -570,6 +593,12 @@ fn collect(cfg: &Config, ssh_config: &Path) -> Vec<Entry> {
             .filter(|h| !h.deleted && !claimed.contains(&h.name.as_str()))
             .map(from_config),
     );
+
+    if cfg.options.use_autossh {
+        for e in entries.iter_mut().filter(|e| e.kind == Kind::Ssh) {
+            use_autossh(&mut e.argv);
+        }
+    }
 
     // Colours are only decidable once the whole screen is known.
     let explicit = |name: &str| -> Option<String> {
@@ -872,6 +901,38 @@ mod tests {
         let names: Vec<String> =
             build(&cfg, &sshcfg).entries.iter().map(|e| e.label().to_string()).collect();
         assert_eq!(names, ["alex"], "only the host nobody deleted");
+    }
+
+    /// The global switch to autossh reaches every ssh tile -- one from
+    /// `~/.ssh/config`, one defined only in config.toml -- and leaves a local
+    /// tile alone: it has no connection to keep alive.
+    #[test]
+    fn use_autossh_option_swaps_the_launcher_for_every_ssh_tile_but_not_local_ones() {
+        let dir = std::env::temp_dir().join("dasshboard-entry-autossh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sshcfg = dir.join("config");
+        std::fs::write(&sshcfg, "Host alex\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.options.use_autossh = true;
+        cfg.hosts.push(override_for("srv", None, None));
+        cfg.locals.push(crate::config::LocalEntry {
+            label: "box".into(),
+            detail: String::new(),
+            command: Some("echo hi".into()),
+            color: None,
+            hidden: false,
+            deleted: false,
+            open_in: None,
+            folder: None,
+            legacy_folders: Vec::new(),
+        });
+
+        let entries = build(&cfg, &sshcfg).entries;
+        let argv_of = |l: &str| entries.iter().find(|e| e.label() == l).unwrap().argv.clone();
+        assert_eq!(argv_of("alex")[0], "autossh", "from ~/.ssh/config");
+        assert_eq!(argv_of("srv")[0], "autossh", "from config.toml alone");
+        assert_eq!(argv_of("box")[0], "echo", "a local tile has no ssh to wrap");
     }
 
     // ------------------------------------------------------------- sections

@@ -134,20 +134,23 @@ pub fn rename_current_tab(title: &str) {
 
 /// Open `argv` somewhere that is not this terminal.
 ///
+/// `title` is what the new tab will be called, already composed by `tab_title`
+/// -- or `None` when `[options] rename_tabs` is off and the tab is left to name
+/// itself.
+///
 /// Only ever reached for a destination `resolve` has already agreed to, so the
 /// `InPlace` arm is a guard rather than a path anyone walks.
 pub fn spawn(
     where_to: OpenIn,
-    label: &str,
+    title: Option<&str>,
     argv: &[String],
     cwd: Option<&str>,
     tint: Option<&str>,
-    emoji: Option<&str>,
     shell_after: bool,
 ) -> Result<String, String> {
     match backend() {
         Backend::Ghostty => {
-            crate::ghostty::open(where_to, label, argv, cwd, tint, emoji, shell_after)
+            crate::ghostty::open(where_to, title, argv, cwd, tint, shell_after)
         }
         Backend::InPlace => {
             Err("this terminal cannot open new tabs -- opens here instead".into())

@@ -62,6 +62,10 @@ fn scale_hex(hex: &str, factor: f32) -> Option<String> {
 /// The program Ghostty runs in the new surface: name the tab, optionally tint
 /// it, then hand the process over so the surface dies with the command.
 ///
+/// `title` is `None` when `[options] rename_tabs` is off: the tab keeps
+/// whatever the terminal would have called it, because the user said their
+/// titles are not ours to set.
+///
 /// `args` is already-split argv, and each element is quoted separately, so a
 /// value containing a space stays one argument instead of two.
 ///
@@ -77,7 +81,7 @@ fn scale_hex(hex: &str, factor: f32) -> Option<String> {
 /// There is no tab-colour property in Ghostty's AppleScript dictionary, so
 /// changing what the surface reports about itself is the available lever.
 fn surface_command(
-    title: &str,
+    title: Option<&str>,
     args: &[String],
     cwd: Option<&str>,
     tint: Option<&str>,
@@ -85,10 +89,16 @@ fn surface_command(
 ) -> String {
     let argv: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
 
+    let mut inner = String::new();
     // The title goes through %s rather than into the format string, so a `%` in
     // a host name cannot corrupt the escape sequence.
-    let mut inner =
-        format!("printf {} {}; ", shell_quote("\\033]0;%s\\007"), shell_quote(title));
+    if let Some(t) = title {
+        inner.push_str(&format!(
+            "printf {} {}; ",
+            shell_quote("\\033]0;%s\\007"),
+            shell_quote(t)
+        ));
+    }
 
     if let Some(hex) = tint {
         if let Some(bg) = scale_hex(hex, 0.13) {
@@ -129,24 +139,20 @@ fn surface_command(
 
 /// Open `argv` in a new Ghostty tab or window; returns the new surface's id.
 ///
-/// `emoji` prefixes the title. A tab title is text, so a coloured circle is the
-/// only way a tile's colour can reach the tab bar itself -- the background tint
-/// colours the surface, not the strip of chrome you actually scan.
+/// `title` arrives already composed -- the same one a handed-over tab gets, so a
+/// session reads the same in the tab bar wherever it landed -- and `None` when
+/// the user has turned renaming off.
 ///
 /// `OpenIn::Current` never reaches here: it is an exec in this process, done by
 /// the caller once the terminal has been restored.
 pub fn open(
     where_to: OpenIn,
-    label: &str,
+    title: Option<&str>,
     argv: &[String],
     cwd: Option<&str>,
     tint: Option<&str>,
-    emoji: Option<&str>,
     shell_after: bool,
 ) -> Result<String, String> {
-    // The same title a handed-over tab gets, so a session reads the same in the
-    // tab bar wherever it landed.
-    let title = crate::launch::tab_title(label, emoji);
     // A new tab still needs a window to live in, so with none open we make one
     // either way.
     let make = if where_to == OpenIn::Window {
@@ -167,7 +173,7 @@ pub fn open(
          environment variables:{{{guard}}}}}\n\
          {make}\n\
          end tell",
-        cmd = applescript_quote(&surface_command(&title, argv, cwd, tint, shell_after)),
+        cmd = applescript_quote(&surface_command(title, argv, cwd, tint, shell_after)),
         guard = applescript_quote(&format!("{SKIP_VAR}=1")),
     ))
 }
@@ -201,7 +207,7 @@ mod tests {
     /// The common case: the session *is* its command, so the command is exec'd
     /// and nothing follows it. `shell_after` is covered on its own below.
     fn surface(title: &str, args: &[String], cwd: Option<&str>, tint: Option<&str>) -> String {
-        surface_command(title, args, cwd, tint, false)
+        surface_command(Some(title), args, cwd, tint, false)
     }
 
     fn argv(v: &[&str]) -> Vec<String> {
@@ -247,17 +253,17 @@ mod tests {
     /// shell when the command is done.
     #[test]
     fn a_command_that_may_exit_is_followed_by_a_shell() {
-        let cmd = surface_command("MEDIA", &argv(&["echo", "hi"]), None, None, true);
+        let cmd = surface_command(Some("MEDIA"), &argv(&["echo", "hi"]), None, None, true);
         assert!(cmd.contains(r"'\''echo'\'' '\''hi'\''; export NO_HSL=1; exec "), "got {cmd}");
         assert!(cmd.contains(&crate::platform::login_shell()), "the shell follows it: {cmd}");
         // ...and only there: the tile that *is* a shell is how you reach the
         // workspace manager, so nothing may suppress it on that path.
-        let plain = surface_command("MACBOOK", &argv(&["/bin/zsh"]), None, None, false);
+        let plain = surface_command(Some("MACBOOK"), &argv(&["/bin/zsh"]), None, None, false);
         assert!(!plain.contains("NO_HSL"), "not on the shell tile: {plain}");
         assert!(!cmd.contains(r"exec '\''echo"), "the command itself is not exec'd: {cmd}");
         // ...and the folder still applies to both halves.
         let with_dir =
-            surface_command("MEDIA", &argv(&["echo", "hi"]), Some("/srv/app"), None, true);
+            surface_command(Some("MEDIA"), &argv(&["echo", "hi"]), Some("/srv/app"), None, true);
         assert!(with_dir.find("cd ") < with_dir.find("echo"), "cd comes first: {with_dir}");
     }
 
@@ -311,6 +317,16 @@ mod tests {
     fn no_tint_means_no_osc_beyond_the_title() {
         let cmd = surface("srv", &argv(&["ssh", "srv"]), None, None);
         assert!(!cmd.contains("]11;") && !cmd.contains("]12;"));
+    }
+
+    /// `rename_tabs = false` reaches here as no title at all: the command runs
+    /// untouched and the tab keeps whatever the terminal calls it.
+    #[test]
+    fn no_title_means_no_rename_but_everything_else_stands() {
+        let cmd = surface_command(None, &argv(&["ssh", "srv"]), None, Some("#4f8ab0"), false);
+        assert!(!cmd.contains("]0;"), "no title sequence: {cmd}");
+        assert!(cmd.contains("]11;") && cmd.contains("]12;"), "the tint is independent");
+        assert!(cmd.contains(r"exec '\''ssh'\'' '\''srv'\''"), "the command still runs");
     }
 
     #[test]

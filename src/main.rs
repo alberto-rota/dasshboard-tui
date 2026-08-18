@@ -184,10 +184,17 @@ fn run_cli() -> io::Result<Option<i32>> {
             let found = entries.iter().find(|e| e.label == name && !e.is_local());
             let (argv, tint) = match found {
                 Some(t) => (t.argv.clone(), t.tint.clone()),
-                None => (vec!["ssh".to_string(), name.clone()], entry::Tint::for_name(&name)),
+                None => {
+                    let mut argv = vec!["ssh".to_string(), name.clone()];
+                    if cfg.options.use_autossh {
+                        entry::use_autossh(&mut argv);
+                    }
+                    (argv, entry::Tint::for_name(&name))
+                }
             };
             let emoji = cfg.options.tab_emoji.then_some(tint.emoji);
             let hex = cfg.options.tint_tabs.then_some(tint.hex);
+            let title = cfg.options.rename_tabs.then(|| launch::tab_title(&name, emoji));
             let where_to = found.and_then(|t| t.open_in).unwrap_or(cfg.options.open_in);
             // --open is a spawn, so "current" would mean this short-lived CLI
             // process; a tab is the only sensible reading.
@@ -201,12 +208,11 @@ fn run_cli() -> io::Result<Option<i32>> {
             // here, in place of this command -- naming the tab on the way, as
             // the tab it would have opened would have been named.
             if !launch::backend().can_spawn() {
-                let title = launch::tab_title(&name, emoji);
                 // Only ssh tiles are reachable here, and an ssh session carries
                 // its own follow-on shell in the remote command.
-                hand_off(&argv, None, Some(&title), false);
+                hand_off(&argv, None, title.as_deref(), false);
             }
-            match launch::spawn(where_to, &name, &argv, None, hex.as_deref(), emoji, false) {
+            match launch::spawn(where_to, title.as_deref(), &argv, None, hex.as_deref(), false) {
                 Ok(id) => {
                     println!("{id}");
                     Ok(Some(0))
@@ -529,6 +535,9 @@ mod tests {
         }
         let i = 0;
         app.entries[i].open_in = Some(OpenIn::Current);
+        // Pinned rather than read: the machine running the tests may have
+        // turned renaming off, and this test is about the default.
+        app.rename_tabs = true;
         let vis = app.visible();
         app.sel = vis.iter().position(|&e| e == i).unwrap();
         let argv = app.entries[i].argv.clone();
@@ -544,6 +553,25 @@ mod tests {
         // of whatever opened the home screen.
         let title = app.handoff_title.expect("a taken-over tab is still a tab");
         assert!(title.ends_with(&label), "the tile names the tab: {title}");
+    }
+
+    /// `rename_tabs = false` is the user saying their titles are set elsewhere:
+    /// the session still hands off, but nothing renames the tab on the way out.
+    #[test]
+    fn rename_tabs_off_hands_off_without_a_title() {
+        use config::OpenIn;
+        let mut app = App::new();
+        if app.entries.is_empty() {
+            return;
+        }
+        app.entries[0].open_in = Some(OpenIn::Current);
+        app.rename_tabs = false;
+        let vis = app.visible();
+        app.sel = vis.iter().position(|&e| e == 0).unwrap();
+        app.activate(&vis);
+        assert!(app.quit, "the session still opens");
+        assert!(app.handoff.is_some(), "the command still hands off");
+        assert!(app.handoff_title.is_none(), "but the tab keeps its name");
     }
 
     /// A one-off key beats the tile's own setting, which beats the global.

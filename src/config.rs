@@ -73,9 +73,19 @@ pub struct Options {
     /// Tint the spawned Ghostty tab's background with the host's colour.
     #[serde(default = "yes")]
     pub tint_tabs: bool,
+    /// Name each tab after its tile. Off leaves the title to the terminal --
+    /// for a shell setup that already sets titles its own way.
+    #[serde(default = "yes")]
+    pub rename_tabs: bool,
     /// Prefix the tab title with the host's coloured circle.
     #[serde(default = "yes")]
     pub tab_emoji: bool,
+    /// Launch ssh hosts through `autossh` instead, so a dropped connection --
+    /// the laptop slept, the network changed -- gets ssh restarted rather than
+    /// left dead. Off by default: it needs a binary of its own, and a plain
+    /// `ssh` is what most tiles expect to run.
+    #[serde(default)]
+    pub use_autossh: bool,
     /// Whether hidden tiles are on screen when the home screen opens. `X`
     /// flips it for the session; this is only the state it starts in, which is
     /// why nothing writes it back -- revealing hidden tiles is a look, not a
@@ -100,7 +110,9 @@ impl Default for Options {
         Self {
             include_ssh_config: true,
             tint_tabs: true,
+            rename_tabs: true,
             tab_emoji: true,
+            use_autossh: false,
             show_hidden: false,
             open_in: OpenIn::Tab,
         }
@@ -516,8 +528,15 @@ fn write_template(path: &PathBuf) -> std::io::Result<()> {
          tint_tabs = true\n\
          # Where a tile opens: \"tab\", \"window\" or \"current\".\n\
          open_in = \"tab\"\n\
+         # Name each tab after its tile. Set to false if your shell already\n\
+         # sets titles its own way.\n\
+         rename_tabs = true\n\
          # Prefix the tab title with the host's coloured circle.\n\
          tab_emoji = true\n\
+         # Launch ssh hosts through autossh instead, so a dropped connection --\n\
+         # the laptop slept, the network changed -- gets ssh restarted rather\n\
+         # than left dead. Needs autossh installed.\n\
+         use_autossh = false\n\
          # Open with hidden tiles already on screen. X toggles them either way.\n\
          show_hidden = false\n\
          \n",
@@ -1136,9 +1155,11 @@ mod tests {
         let p = scratch("options", SEED);
         set_kv_at(&p, "options", "include_ssh_config", "false").unwrap();
         set_kv_at(&p, "options", "tab_emoji", "false").unwrap();
+        set_kv_at(&p, "options", "rename_tabs", "false").unwrap();
         let cfg = parse(&p);
         assert!(!cfg.options.include_ssh_config, "existing key rewritten");
         assert!(!cfg.options.tab_emoji, "absent key added");
+        assert!(!cfg.options.rename_tabs, "renaming can be turned off");
         assert!(cfg.options.tint_tabs, "untouched key keeps its default");
         let text = fs::read_to_string(&p).unwrap();
         assert_eq!(text.matches("include_ssh_config").count(), 1, "written once");

@@ -105,7 +105,9 @@ pub struct App {
     pub handoff_shell_after: bool,
     pub include_ssh_config: bool,
     pub tint_tabs: bool,
+    pub rename_tabs: bool,
     pub tab_emoji: bool,
+    pub use_autossh: bool,
     /// Whether hidden tiles are on screen. A view, not a setting: `X` flips it
     /// and nothing writes it back, so peeking at what you have put away costs
     /// no edit to the file. `[options] show_hidden` decides where it starts.
@@ -146,7 +148,9 @@ impl App {
             handoff_shell_after: false,
             include_ssh_config: true,
             tint_tabs: true,
+            rename_tabs: true,
             tab_emoji: true,
+            use_autossh: false,
             show_hidden: false,
             open_in: OpenIn::Tab,
             theme: Theme::default(),
@@ -162,7 +166,9 @@ impl App {
         let (cfg, err) = config::load();
         self.include_ssh_config = cfg.options.include_ssh_config;
         self.tint_tabs = cfg.options.tint_tabs;
+        self.rename_tabs = cfg.options.rename_tabs;
         self.tab_emoji = cfg.options.tab_emoji;
+        self.use_autossh = cfg.options.use_autossh;
         self.open_in = cfg.options.open_in;
         if std::mem::take(&mut self.first_load) {
             self.show_hidden = cfg.options.show_hidden;
@@ -230,10 +236,24 @@ impl App {
             // Not marked inert: a tab we take over gets its title set on the way
             // out, which is an escape sequence any terminal understands.
             SettingRow::Toggle {
+                key: "rename_tabs",
+                label: "name the tab after the tile",
+                on: self.rename_tabs,
+                note: "",
+            },
+            SettingRow::Toggle {
                 key: "tab_emoji",
                 label: "coloured circle in the tab title",
                 on: self.tab_emoji,
-                note: "",
+                // The circle rides on the title, so with no renaming there is
+                // nothing for it to ride on.
+                note: if self.rename_tabs { "" } else { "renaming is off" },
+            },
+            SettingRow::Toggle {
+                key: "use_autossh",
+                label: "reconnect with autossh after sleep",
+                on: self.use_autossh,
+                note: if platform::which("autossh").is_some() { "" } else { "autossh not found" },
             },
             SettingRow::Choice {
                 key: "open_in",
@@ -322,6 +342,10 @@ impl App {
         let shell_after = e.shell_after;
         let tint = self.tint_tabs.then(|| e.tint.hex.clone());
         let emoji = self.tab_emoji.then_some(e.tint.emoji);
+        // `rename_tabs = false` is the user saying tab titles are theirs: no
+        // title reaches the spawned surface, and a handed-over tab keeps the
+        // name it already had.
+        let title = self.rename_tabs.then(|| launch::tab_title(&e.label, emoji));
         // A tile is one place now, so where it lands is worth saying once it is
         // somewhere other than the obvious one.
         let where_text = match e.folder.as_deref() {
@@ -335,7 +359,7 @@ impl App {
             // tab we are in was called whatever opened the home screen, and a
             // session that took it over should read as itself in the tab bar,
             // exactly as a spawned one does.
-            self.handoff_title = Some(launch::tab_title(&label, emoji));
+            self.handoff_title = title;
             self.handoff = Some(argv);
             self.handoff_cwd = cwd;
             self.handoff_shell_after = shell_after;
@@ -344,11 +368,10 @@ impl App {
         }
         match launch::spawn(
             where_to,
-            &label,
+            title.as_deref(),
             &argv,
             cwd.as_deref(),
             tint.as_deref(),
-            emoji,
             shell_after,
         ) {
             Ok(_) => self.say(format!("opened {where_text} — {label}"), true),
